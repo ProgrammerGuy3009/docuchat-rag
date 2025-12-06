@@ -1,0 +1,13 @@
+# --- GLOBAL IGNORES ---
+.DS_Store
+.env
+
+# --- BACKEND IGNORES ---
+backend/venv/
+backend/__pycache__/
+backend/.env
+
+# --- FRONTEND IGNORES ---
+frontend/node_modules/
+frontend/dist/
+frontend/.env

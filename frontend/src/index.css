@@ -1,0 +1,51 @@
+@import "tailwindcss";
+
+/* --- 1. UNIVERSAL CUSTOM SCROLLBAR --- */
+
+/* Firefox (needs specific properties) */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #334155 transparent; /* Thumb Color / Track Color */
+}
+
+/* Chrome, Edge, Safari */
+::-webkit-scrollbar {
+  width: 8px; /* Slightly wider so it's usable */
+  height: 8px; /* For horizontal scrolling */
+}
+
+::-webkit-scrollbar-track {
+  background: transparent; /* See-through track */
+}
+
+::-webkit-scrollbar-thumb {
+  background-color: #334155; /* Slate-600 (Dark Grey) */
+  border-radius: 20px; /* Pill shape */
+  border: 2px solid transparent; /* Creates padding effect */
+  background-clip: content-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background-color: #22d3ee; /* Cyan-400 (Glow effect on hover) */
+}
+
+/* --- 2. SMOOTH ANIMATIONS --- */
+
+@keyframes blob {
+  0% { transform: translate(0px, 0px) scale(1); }
+  33% { transform: translate(30px, -50px) scale(1.1); }
+  66% { transform: translate(-20px, 20px) scale(0.9); }
+  100% { transform: translate(0px, 0px) scale(1); }
+}
+
+.animate-blob {
+  animation: blob 7s infinite;
+}
+
+.animation-delay-2000 {
+  animation-delay: 2s;
+}
+
+.animation-delay-4000 {
+  animation-delay: 4s;
+}
