@@ -234,6 +234,7 @@ async def get_llm_answer(context: str, question: str, history: list) -> str:
 # API Endpoints
 # ---------------------------------------------------------------------------
 @app.get("/", tags=["Health"])
+@app.head("/", tags=["Health"])
 def health_check():
     """Health check endpoint — used by Render / monitoring services."""
     return {
