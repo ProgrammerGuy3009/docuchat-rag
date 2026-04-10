@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from "react";
 import axios from "axios";
-import { Send, Upload, FileText, Bot, User, Sparkles, X, Menu } from "lucide-react";
+import { Send, Upload, FileText, Bot, User, Sparkles, X, Menu, PlusCircle } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 
 // Dynamic API URL — reads from env at build time, falls back to localhost
@@ -16,6 +16,17 @@ export default function App() {
   const [uploading, setUploading] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   
+  // Unique session ID to isolate document uploads in Pinecone Namespaces
+  const [sessionId, setSessionId] = useState(() => Math.random().toString(36).substring(2, 10));
+
+  const handleNewChat = () => {
+    setSessionId(Math.random().toString(36).substring(2, 10));
+    setFile(null);
+    setMessages([
+      { role: "bot", text: "Hello! Your memory has been wiped clean. Upload a new PDF to begin." }
+    ]);
+  };
+  
   // Auto-scroll to bottom
   const messagesEndRef = useRef(null);
   const scrollToBottom = () => {
@@ -28,6 +39,7 @@ export default function App() {
     setUploading(true);
     const formData = new FormData();
     formData.append("file", file);
+    formData.append("session_id", sessionId);
 
     try {
       await axios.post(`${API_URL}/upload-pdf/`, formData);
@@ -54,7 +66,8 @@ export default function App() {
       
       const response = await axios.post(`${API_URL}/chat/`, { 
         question: input,
-        history: historyMsg
+        history: historyMsg,
+        session_id: sessionId
       });
       const botMessage = { role: "bot", text: response.data.answer };
       setMessages((prev) => [...prev, botMessage]);
@@ -129,6 +142,13 @@ export default function App() {
                   )}
                 </button>
               </div>
+              
+              <button 
+                onClick={handleNewChat}
+                className="mt-2 w-full py-2.5 bg-slate-800 text-slate-300 hover:text-white hover:bg-slate-700 rounded-lg font-medium text-sm transition-all flex items-center justify-center gap-2 border border-slate-700 hover:border-slate-500"
+              >
+                <PlusCircle size={16} /> New Chat & Clear
+              </button>
             </div>
 
             <div className="p-4 border-t border-white/10 text-xs text-slate-500 text-center">

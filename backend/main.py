@@ -15,7 +15,7 @@ from typing import Optional
 import httpx
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from groq import AsyncGroq
 from pinecone import Pinecone
@@ -144,6 +144,7 @@ class MessageContext(BaseModel):
 class ChatRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=2000)
     history: list[MessageContext] = Field(default_factory=list)
+    session_id: str = Field(..., description="Unique session ID to act as a namespace")
 
 
 class EvalSample(BaseModel):
@@ -153,6 +154,7 @@ class EvalSample(BaseModel):
 
 class EvalRequest(BaseModel):
     samples: list[EvalSample] = Field(..., min_length=1, max_length=50)
+    session_id: str = Field(..., description="Session ID to evaluate context from")
 
 
 # ---------------------------------------------------------------------------
@@ -183,12 +185,13 @@ def generate_embeddings(texts: list[str]) -> list[list[float]]:
 
 
 @traceable(name="search_pinecone")
-def search_pinecone(query_vector: list[float], top_k: int = 5) -> str:
+def search_pinecone(query_vector: list[float], top_k: int = 5, namespace: str = "") -> str:
     """Query Pinecone and return concatenated context text."""
     results = pinecone_index.query(
         vector=query_vector,
         top_k=top_k,
         include_metadata=True,
+        namespace=namespace
     )
     context_parts: list[str] = []
     for match in results.get("matches", []):
@@ -247,7 +250,10 @@ def health_check():
 
 @app.post("/upload-pdf/", tags=["Documents"])
 @traceable(name="upload_pdf")
-async def upload_pdf(file: UploadFile = File(...)):
+async def upload_pdf(
+    file: UploadFile = File(...),
+    session_id: str = Form(..., description="Unique session ID for namespace")
+):
     """
     Upload a PDF → extract text → chunk → embed → store in Pinecone.
     Fully async-safe and handles 300+ page documents efficiently.
@@ -294,7 +300,7 @@ async def upload_pdf(file: UploadFile = File(...)):
                         "chunk_index": j,
                     },
                 })
-            pinecone_index.upsert(vectors=batch_vectors)
+            pinecone_index.upsert(vectors=batch_vectors, namespace=session_id)
 
         elapsed = round(time.time() - start_time, 2)
         logger.info(f"✅ Upload complete: {file.filename} in {elapsed}s")
@@ -333,7 +339,7 @@ async def chat(request: ChatRequest):
 
         # 2. Search Pinecone for relevant context
         context_text = await asyncio.to_thread(
-            search_pinecone, query_vector, 5
+            search_pinecone, query_vector, 5, request.session_id
         )
 
         if not context_text:
@@ -393,7 +399,7 @@ async def evaluate(request: EvalRequest):
                 generate_embeddings, [sample.question]
             )
             query_vector = query_embedding[0]
-            context_text = await asyncio.to_thread(search_pinecone, query_vector, 5)
+            context_text = await asyncio.to_thread(search_pinecone, query_vector, 5, request.session_id)
             ai_response = await get_llm_answer(context_text, sample.question, [])
 
             questions.append(sample.question)
