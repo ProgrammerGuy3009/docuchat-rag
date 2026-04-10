@@ -16,11 +16,13 @@ import httpx
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile, Form
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from groq import AsyncGroq
 from pinecone import Pinecone
 from pydantic import BaseModel, Field
 import fitz  # PyMuPDF
+import voyageai
 
 # ---------------------------------------------------------------------------
 # LangSmith Tracing — automatically enabled when env vars are set
@@ -47,6 +49,7 @@ logger = logging.getLogger("docuchat")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "docuchat")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+VOYAGE_API_KEY = os.getenv("VOYAGE_API_KEY")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
 
 # Render gives us the external URL via this env var (or set it manually)
@@ -56,19 +59,19 @@ KEEP_ALIVE_INTERVAL = int(os.getenv("KEEP_ALIVE_INTERVAL", "600"))  # seconds (1
 # LangSmith env vars are read automatically by the SDK:
 #   LANGCHAIN_TRACING_V2, LANGCHAIN_API_KEY, LANGCHAIN_PROJECT
 
-if not PINECONE_API_KEY or not GROQ_API_KEY:
+if not PINECONE_API_KEY or not GROQ_API_KEY or not VOYAGE_API_KEY:
     raise ValueError(
         "Missing required API keys. "
-        "Ensure PINECONE_API_KEY and GROQ_API_KEY are set in your .env file."
+        "Ensure PINECONE_API_KEY, VOYAGE_API_KEY, and GROQ_API_KEY are set in your .env file."
     )
 
 # ---------------------------------------------------------------------------
 # Global Clients (initialised once at startup)
 # ---------------------------------------------------------------------------
-embedding_model = None  # will be set in lifespan
 pc = Pinecone(api_key=PINECONE_API_KEY)
 pinecone_index = pc.Index(PINECONE_INDEX_NAME)
 groq_client = AsyncGroq(api_key=GROQ_API_KEY)
+voyage_client = voyageai.AsyncClient(api_key=VOYAGE_API_KEY)
 
 
 # ---------------------------------------------------------------------------
@@ -98,12 +101,8 @@ async def _keep_alive_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup / shutdown lifecycle — load the embedding model + start keep-alive."""
-    global embedding_model
-    logger.info("⏳ Loading FastEmbed model (first run downloads ~90 MB)...")
-    from fastembed import TextEmbedding
-    embedding_model = TextEmbedding("BAAI/bge-small-en-v1.5")  # 384-dim, very fast on CPU
-    logger.info("✅ Embedding model ready.")
+    """Startup / shutdown lifecycle — start keep-alive."""
+    logger.info("✅ Clients initialized.")
 
     # Start the keep-alive background task
     keep_alive_task = asyncio.create_task(_keep_alive_loop())
@@ -178,29 +177,41 @@ def chunk_text(text: str, chunk_size: int = 500, overlap: int = 100) -> list[str
 
 
 @traceable(name="generate_embeddings")
-def generate_embeddings(texts: list[str]) -> list[list[float]]:
-    """Generate embeddings locally via FastEmbed (CPU, no API calls)."""
-    embeddings = list(embedding_model.embed(texts))
-    return [e.tolist() for e in embeddings]
+async def generate_embeddings(texts: list[str], input_type: str = "document") -> list[list[float]]:
+    """Generate embeddings via VoyageAI Remote API."""
+    result = await voyage_client.embed(texts, model="voyage-3", input_type=input_type)
+    return result.embeddings
 
 
 @traceable(name="search_pinecone")
-def search_pinecone(query_vector: list[float], top_k: int = 5, namespace: str = "") -> str:
-    """Query Pinecone and return concatenated context text."""
+def search_pinecone(query_vector: list[float], top_k: int = 15, namespace: str = "") -> list[str]:
+    """Query Pinecone and return list of context document strings."""
     results = pinecone_index.query(
         vector=query_vector,
         top_k=top_k,
         include_metadata=True,
         namespace=namespace
     )
-    context_parts: list[str] = []
+    docs = []
     for match in results.get("matches", []):
         text = match.get("metadata", {}).get("text", "")
-        score = match.get("score", 0)
         if text:
-            context_parts.append(f"[Relevance: {score:.2f}]\n{text}")
-    return "\n---\n".join(context_parts)
+            docs.append(text)
+    return docs
 
+@traceable(name="check_semantic_cache")
+def check_semantic_cache(query_vector: list[float]) -> str | None:
+    """Check Pinecone cache namespace for identical semantic hits."""
+    results = pinecone_index.query(
+        vector=query_vector,
+        top_k=1,
+        include_metadata=True,
+        namespace="semantic-cache"
+    )
+    matches = results.get("matches", [])
+    if matches and matches[0].get("score", 0) > 0.95:
+        return matches[0].get("metadata", {}).get("answer")
+    return None
 
 @traceable(name="llm_answer")
 async def get_llm_answer(context: str, question: str, history: list) -> str:
@@ -285,8 +296,8 @@ async def upload_pdf(
         logger.info(f"Chunking took: {t2 - t1:.2f} seconds")
         logger.info(f"   Chunks created: {len(chunks)}")
 
-        # 3. Embedding Step (Usually the slowest part)
-        embeddings = await asyncio.to_thread(generate_embeddings, chunks)
+        # 3. Embedding Step (Voyage AI)
+        embeddings = await generate_embeddings(chunks, input_type="document")
         t3 = time.time()
         logger.info(f"FastEmbed CPU math took: {t3 - t2:.2f} seconds")
         logger.info(f"   Embeddings generated: {len(embeddings)}")
@@ -331,47 +342,81 @@ async def upload_pdf(
 @app.post("/chat/", tags=["Chat"])
 @traceable(name="chat")
 async def chat(request: ChatRequest):
-    """
-    RAG pipeline: embed question → search Pinecone → augment prompt → LLM answer.
-    """
+    """RAG pipeline: Cache Check → Embed → Pinecone Search → Voyage Rerank → Llama-3 Stream"""
     start_time = time.time()
 
-    try:
-        user_query = request.question
+    user_query = request.question
 
-        # 1. Embed the question
-        query_embedding = await asyncio.to_thread(
-            generate_embeddings, [user_query]
+    # 1. Embed the Question
+    query_result = await voyage_client.embed([user_query], model="voyage-3", input_type="query")
+    query_vector = query_result.embeddings[0]
+
+    # 2. Semantic Cache Check
+    cached_answer = await asyncio.to_thread(check_semantic_cache, query_vector)
+    if cached_answer:
+        async def stream_cache():
+            for word in cached_answer.split(" "):
+                yield word + " "
+                await asyncio.sleep(0.02)
+        return StreamingResponse(stream_cache(), media_type="text/event-stream")
+
+    # 3. Search Pinecone for rough top 15
+    docs = await asyncio.to_thread(
+        search_pinecone, query_vector, 15, request.session_id
+    )
+
+    if not docs:
+        async def empty_response(): yield "I don't have any documents indexed yet. Please upload a PDF first."
+        return StreamingResponse(empty_response(), media_type="text/event-stream")
+
+    # 4. Rerank using Voyage Reranker to get the absolute best top 5
+    rerank_result = await voyage_client.rerank(user_query, docs, model="rerank-2", top_k=5)
+    final_context = "\n---\n".join([r.document for r in rerank_result.results])
+
+    # 5. Build Llama-3 System Prompt
+    system_prompt = (
+        "You are DocuChat, a highly precise AI assistant. "
+        "You may respond politely to basic conversational greetings. "
+        "However, for ANY request for information, facts, or tasks, you MUST answer based ONLY on the provided document Context. "
+        "If the user asks for something that is NOT explicitly present in the provided Context or conversation history, you MUST reply: "
+        "\"I don't find that information in the uploaded document.\" DO NOT invent answers."
+    )
+    
+    messages = [{"role": "system", "content": system_prompt}]
+    for msg in request.history[-6:]:
+        messages.append({"role": "assistant" if msg.role == "bot" else "user", "content": msg.text})
+    
+    messages.append({"role": "user", "content": f"Context from Document:\n{final_context}\n\nUser Question:\n{user_query}"})
+
+    # 6. Stream to Frontend
+    completion = await groq_client.chat.completions.create(
+        model="llama-3.1-8b-instant",
+        messages=messages,
+        temperature=0.2,
+        max_tokens=1024,
+        stream=True
+    )
+
+    async def stream_generator():
+        answer_parts = []
+        async for chunk in completion:
+            delta = chunk.choices[0].delta.content
+            if delta:
+                answer_parts.append(delta)
+                yield delta
+                
+        # 7. Add generated full answer to Semantic Cache for future identical questions
+        full_answer = "".join(answer_parts)
+        pinecone_index.upsert(
+            vectors=[{
+                "id": f"cache-{int(time.time())}",
+                "values": query_vector,
+                "metadata": {"answer": full_answer}
+            }],
+            namespace="semantic-cache"
         )
-        query_vector = query_embedding[0]
-
-        # 2. Search Pinecone for relevant context
-        context_text = await asyncio.to_thread(
-            search_pinecone, query_vector, 5, request.session_id
-        )
-
-        if not context_text:
-            return {
-                "answer": "I don't have any documents indexed yet. Please upload a PDF first.",
-                "context_used": "",
-                "response_time_seconds": round(time.time() - start_time, 2),
-            }
-
-        # 3. Get answer from Groq LLM
-        ai_response = await get_llm_answer(context_text, user_query, request.history)
-
-        elapsed = round(time.time() - start_time, 2)
-        logger.info(f"💬 Chat answered in {elapsed}s")
-
-        return {
-            "answer": ai_response,
-            "context_used": context_text,
-            "response_time_seconds": elapsed,
-        }
-
-    except Exception as e:
-        logger.error(f"❌ Chat error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Chat failed: {str(e)}")
+        
+    return StreamingResponse(stream_generator(), media_type="text/event-stream")
 
 
 @app.post("/evaluate/", tags=["Evaluation"])
@@ -403,11 +448,10 @@ async def evaluate(request: EvalRequest):
 
         # Run each question through the RAG pipeline
         for sample in request.samples:
-            query_embedding = await asyncio.to_thread(
-                generate_embeddings, [sample.question]
-            )
+            query_embedding = await generate_embeddings([sample.question], input_type="query")
             query_vector = query_embedding[0]
-            context_text = await asyncio.to_thread(search_pinecone, query_vector, 5, request.session_id)
+            docs = await asyncio.to_thread(search_pinecone, query_vector, 5, request.session_id)
+            context_text = "\n---\n".join(docs) if docs else ""
             ai_response = await get_llm_answer(context_text, sample.question, [])
 
             questions.append(sample.question)

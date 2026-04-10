@@ -10,8 +10,8 @@ pymupdf
 # --- Vector Database ---
 pinecone
 
-# --- Embeddings (CPU-optimized, no GPU needed) ---
-fastembed
+# --- Embeddings (Remote API, lightning fast) ---
+voyageai
 
 # --- LLM ---
 groq

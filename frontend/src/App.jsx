@@ -109,22 +109,55 @@ export default function App() {
     
     const userMessage = { role: "user", text: input };
     setMessages((prev) => [...prev, userMessage]);
+    
+    // Create an empty bot message that we will stream into
+    setMessages((prev) => [...prev, { role: "bot", text: "" }]);
+    
+    const requestInput = input;
     setInput("");
     setLoading(true);
 
     try {
       const historyMsg = messages.slice(1).map(msg => ({ role: msg.role, text: msg.text }));
       
-      const response = await axios.post(`${API_URL}/chat/`, { 
-        question: input,
-        history: historyMsg,
-        session_id: sessionId
+      const response = await fetch(`${API_URL}/chat/`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          question: requestInput,
+          history: historyMsg,
+          session_id: sessionId
+        })
       });
-      const botMessage = { role: "bot", text: response.data.answer };
-      
-      setMessages((prev) => [...prev, botMessage]);
+
+      if (!response.ok) throw new Error("Backend error");
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder("utf-8");
+      let streamText = "";
+
+      // Stream loop reading chunks directly as they arrive from Python/Groq
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        
+        streamText += decoder.decode(value, { stream: true });
+        
+        // Update the very last message in the state with the ongoing stream text
+        setMessages((prev) => {
+          const newMessages = [...prev];
+          newMessages[newMessages.length - 1].text = streamText;
+          return newMessages;
+        });
+      }
     } catch (error) {
-      setMessages((prev) => [...prev, { role: "bot", text: "Error: Could not reach the brain. Ensure your Render backend is active." }]);
+      setMessages((prev) => {
+        const newMessages = [...prev];
+        newMessages[newMessages.length - 1].text = "Error: Could not reach the AI. Ensure your API keys are correct.";
+        return newMessages;
+      });
     } finally {
       setLoading(false);
     }
