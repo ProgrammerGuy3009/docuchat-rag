@@ -42,6 +42,28 @@ export default function App() {
   const [uploading, setUploading] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   
+  const [uploadStep, setUploadStep] = useState(0);
+  const loadingSteps = [
+    { title: "Uploading...", desc: "Transferring file securely" },
+    { title: "Reading PDF...", desc: "Extracting raw text via PyMuPDF" },
+    { title: "Chunking Data...", desc: "Analyzing segments of text" },
+    { title: "Generating Vectors...", desc: "Processing 384-dimensional arrays" },
+    { title: "Syncing Knowledge Base...", desc: "Uploading to Pinecone serverless DB" }
+  ];
+
+  useEffect(() => {
+    let interval;
+    if (uploading) {
+      setUploadStep(0);
+      interval = setInterval(() => {
+        setUploadStep((prev) => (prev < loadingSteps.length - 1 ? prev + 1 : prev));
+      }, 3500);
+    } else {
+      setUploadStep(0);
+    }
+    return () => clearInterval(interval);
+  }, [uploading]);
+
   const [sessionId, setSessionId] = useState(() => Math.random().toString(36).substring(2, 10));
 
   const handleNewChat = () => {
@@ -173,11 +195,20 @@ export default function App() {
                     )}
                     
                     <span className="text-sm font-medium text-zinc-300">
-                      {uploading ? "Indexing..." : file ? file.name : "Upload PDF"}
+                      {uploading ? loadingSteps[uploadStep].title : file ? file.name : "Upload PDF"}
                     </span>
                     <span className="text-xs text-zinc-600 mt-1">
-                      {uploading ? "Creating Vectors" : file ? "Ready to query" : "PDF format only"}
+                      {uploading ? loadingSteps[uploadStep].desc : file ? "Ready to query" : "PDF format only"}
                     </span>
+                    
+                    {uploading && (
+                      <div className="w-full bg-zinc-800 rounded-full h-1 mt-4 mb-1 overflow-hidden">
+                        <div 
+                          className="bg-zinc-400 h-1 rounded-full transition-all duration-1000 ease-in-out" 
+                          style={{ width: `${((uploadStep + 1) / loadingSteps.length) * 100}%` }}
+                        ></div>
+                      </div>
+                    )}
                   </div>
                 </div>
               </div>
