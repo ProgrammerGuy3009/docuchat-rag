@@ -13,6 +13,7 @@ from contextlib import asynccontextmanager
 from typing import Optional
 
 import httpx
+import re
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile, Form
@@ -23,6 +24,7 @@ from pinecone import Pinecone
 from pydantic import BaseModel, Field
 import fitz  # PyMuPDF
 import voyageai
+import base64
 
 # ---------------------------------------------------------------------------
 # LangSmith Tracing — automatically enabled when env vars are set
@@ -159,6 +161,15 @@ class EvalRequest(BaseModel):
 # ---------------------------------------------------------------------------
 # Helper Functions
 # ---------------------------------------------------------------------------
+def pii_scrubber(text: str) -> str:
+    """Fast Regex PII masking before text hits external APIS or VectorDB."""
+    # 1. Credit Cards (13-19 digits)
+    text = re.sub(r'\b(?:\d[ -]*?){13,16}\b', '[REDACTED_CC]', text)
+    # 2. Emails
+    text = re.sub(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+', '[REDACTED_EMAIL]', text)
+    # 3. Phone Numbers
+    text = re.sub(r'\+?\d{1,3}[-.\s]?\(?\d{2,3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b', '[REDACTED_PHONE]', text)
+    return text
 def chunk_text(text: str, chunk_size: int = 500, overlap: int = 100) -> list[str]:
     """
     Split text into overlapping chunks.
@@ -276,10 +287,45 @@ async def upload_pdf(
     logger.info(f"📄 Upload started: {file.filename}")
 
     try:
-        # 1. Parsing Step
+        # 1. Parsing Step (Text + Multimodal Images)
         contents = await file.read()
         doc = fitz.open(stream=contents, filetype="pdf")
-        full_text = "\n".join(page.get_text() for page in doc)
+        
+        text_parts = []
+        vision_tasks = []
+        for page_num in range(len(doc)):
+            page = doc[page_num]
+            text_parts.append(page.get_text())
+            
+            # Extract images for Voyage text-injection
+            for img in page.get_images(full=True):
+                try:
+                    xref = img[0]
+                    base_image = doc.extract_image(xref)
+                    image_bytes = base_image["image"]
+                    b64_image = base64.b64encode(image_bytes).decode('utf-8')
+                    vision_tasks.append(
+                        groq_client.chat.completions.create(
+                            model="llama-3.2-11b-vision-preview",
+                            messages=[{
+                                "role": "user",
+                                "content": [
+                                    {"type": "text", "text": "Describe this image, chart, or graph in extreme detail so it can be numerically embedded into a database. Do not include introductory text."},
+                                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"}}
+                                ]
+                            }],
+                            max_tokens=300
+                        )
+                    )
+                except Exception:
+                    pass
+                    
+        vision_responses = await asyncio.gather(*vision_tasks, return_exceptions=True)
+        for resp in vision_responses:
+            if not isinstance(resp, Exception) and resp.choices:
+                text_parts.append(f"\n[IMAGE DATAPOINT]\n{resp.choices[0].message.content}\n")
+
+        full_text = pii_scrubber("\n".join(text_parts))
         
         t1 = time.time()
         logger.info(f"PDF Extraction took: {t1 - start_time:.2f} seconds")
@@ -342,12 +388,47 @@ async def upload_pdf(
 @app.post("/chat/", tags=["Chat"])
 @traceable(name="chat")
 async def chat(request: ChatRequest):
-    """RAG pipeline: Cache Check → Embed → Pinecone Search → Voyage Rerank → Llama-3 Stream"""
+    """RAG pipeline: Router → Cache Check → Embed → Pinecone Search → Voyage Rerank → 70B Llama-3 Stream"""
     start_time = time.time()
 
-    user_query = request.question
+    user_query = pii_scrubber(request.question)
 
-    # 1. Embed the Question
+    # 1. LLM Router (Triage & Compliance)
+    router_prompt = (
+        "You are a routing logic system and compliance filter. The user has asked the following message: "
+        f"'{user_query}'\n"
+        "If this is a simple greeting, a thank you, or a basic conversational statement that DOES NOT require scanning an uploaded document, output EXACTLY the word SIMPLE. "
+        "If the user is submitting or asking about a password, credit card, social security number, or explicit personal secret to you, output EXACTLY the word REDACTED. "
+        "If this is asking for knowledge, facts, numbers, or requires document analysis, output EXACTLY the word COMPLEX."
+    )
+    router_resp = await groq_client.chat.completions.create(
+        model="llama-3.1-8b-instant",
+        messages=[{"role": "user", "content": router_prompt}],
+        max_tokens=10,
+        temperature=0.0
+    )
+    router_content = router_resp.choices[0].message.content.lower()
+
+    if "redacted" in router_content:
+        async def redacted_stream(): yield "⚠️ System Block: Your query contains sensitive Confidential Information and was redacted before touching our databases."
+        return StreamingResponse(redacted_stream(), media_type="text/event-stream")
+
+    if "simple" in router_content:
+        # Bypass RAG entirely for conversational speed
+        completion = await groq_client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[{"role": "user", "content": user_query}],
+            temperature=0.7,
+            max_tokens=500,
+            stream=True
+        )
+        async def fast_stream():
+            async for chunk in completion:
+                delta = chunk.choices[0].delta.content
+                if delta: yield delta
+        return StreamingResponse(fast_stream(), media_type="text/event-stream")
+
+    # 2. Embed the Question
     query_result = await voyage_client.embed([user_query], model="voyage-3", input_type="query")
     query_vector = query_result.embeddings[0]
 
@@ -388,9 +469,9 @@ async def chat(request: ChatRequest):
     
     messages.append({"role": "user", "content": f"Context from Document:\n{final_context}\n\nUser Question:\n{user_query}"})
 
-    # 6. Stream to Frontend
+    # 6. Stream to Frontend using massive 70B model
     completion = await groq_client.chat.completions.create(
-        model="llama-3.1-8b-instant",
+        model="llama-3.3-70b-versatile",
         messages=messages,
         temperature=0.2,
         max_tokens=1024,
