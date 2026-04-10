@@ -7,7 +7,7 @@ python-dotenv
 pypdf
 
 # --- Vector Database ---
-pinecone-client
+pinecone
 
 # --- Embeddings (CPU-optimized, no GPU needed) ---
 fastembed
