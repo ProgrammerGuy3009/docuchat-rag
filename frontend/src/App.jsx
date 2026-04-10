@@ -49,7 +49,13 @@ export default function App() {
     setLoading(true);
 
     try {
-      const response = await axios.post(`${API_URL}/chat/`, { question: input });
+      // Send chat history (excluding the first welcome string)
+      const historyMsg = messages.slice(1).map(msg => ({ role: msg.role, text: msg.text }));
+      
+      const response = await axios.post(`${API_URL}/chat/`, { 
+        question: input,
+        history: historyMsg
+      });
       const botMessage = { role: "bot", text: response.data.answer };
       setMessages((prev) => [...prev, botMessage]);
     } catch (error) {

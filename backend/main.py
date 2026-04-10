@@ -137,8 +137,13 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 # Pydantic Models
 # ---------------------------------------------------------------------------
+class MessageContext(BaseModel):
+    role: str
+    text: str
+
 class ChatRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=2000)
+    history: list[MessageContext] = Field(default_factory=list)
 
 
 class EvalSample(BaseModel):
@@ -195,23 +200,30 @@ def search_pinecone(query_vector: list[float], top_k: int = 5) -> str:
 
 
 @traceable(name="llm_answer")
-async def get_llm_answer(context: str, question: str) -> str:
+async def get_llm_answer(context: str, question: str, history: list) -> str:
     """Send the augmented prompt to Groq (Llama-3) and return the answer."""
     system_prompt = (
-        "You are a precise, helpful AI assistant. "
-        "Answer the user's question based ONLY on the provided context. "
-        "If the answer is not in the context, say: "
-        "\"I don't find that information in the uploaded document.\" "
+        "You are DocuChat, a highly precise AI assistant. "
+        "You may respond politely to basic conversational greetings (like 'Hi' or 'Hello'). "
+        "However, for ANY request for information, facts, or tasks, you MUST answer based ONLY on the provided document Context. "
+        "If the user asks for something that is NOT explicitly present in the provided Context or conversation history, you MUST reply: "
+        "\"I don't find that information in the uploaded document.\" DO NOT answer general knowledge questions or invent answers. "
         "Cite specific parts of the context when possible."
     )
-    user_prompt = f"Context:\n{context}\n\nQuestion:\n{question}"
+    
+    messages = [{"role": "system", "content": system_prompt}]
+    
+    # Inject conversational history (last 6 messages to preserve context)
+    for msg in history[-6:]:
+        role = "assistant" if msg.role == "bot" else "user"
+        messages.append({"role": role, "content": msg.text})
+
+    user_prompt = f"Context from Document:\n{context}\n\nUser Question:\n{question}"
+    messages.append({"role": "user", "content": user_prompt})
 
     completion = await groq_client.chat.completions.create(
         model="llama-3.1-8b-instant",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
+        messages=messages,
         temperature=0.2,  # lower = more factual, less creative
         max_tokens=1024,
     )
@@ -331,7 +343,7 @@ async def chat(request: ChatRequest):
             }
 
         # 3. Get answer from Groq LLM
-        ai_response = await get_llm_answer(context_text, user_query)
+        ai_response = await get_llm_answer(context_text, user_query, request.history)
 
         elapsed = round(time.time() - start_time, 2)
         logger.info(f"💬 Chat answered in {elapsed}s")
@@ -381,7 +393,7 @@ async def evaluate(request: EvalRequest):
             )
             query_vector = query_embedding[0]
             context_text = await asyncio.to_thread(search_pinecone, query_vector, 5)
-            ai_response = await get_llm_answer(context_text, sample.question)
+            ai_response = await get_llm_answer(context_text, sample.question, [])
 
             questions.append(sample.question)
             ground_truths.append(sample.ground_truth)
