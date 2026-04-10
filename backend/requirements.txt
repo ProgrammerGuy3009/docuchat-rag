@@ -1,0 +1,31 @@
+# --- Core Framework ---
+fastapi==0.115.12
+uvicorn[standard]==0.34.3
+python-dotenv==1.1.0
+
+# --- PDF Processing ---
+pypdf==5.6.0
+
+# --- Vector Database ---
+pinecone-client==6.0.2
+
+# --- Embeddings (CPU-optimized, no GPU needed) ---
+fastembed==0.6.1
+
+# --- LLM ---
+groq==0.25.0
+
+# --- Monitoring & Tracing ---
+langsmith==0.3.42
+
+# --- Evaluation ---
+ragas==0.2.16
+datasets==3.6.0
+langchain-groq==0.3.2
+langchain-core==0.3.51
+
+# --- Async HTTP (for any remaining external calls) ---
+httpx==0.28.1
+
+# --- Data Validation (already bundled with FastAPI, pinned for clarity) ---
+pydantic==2.11.4

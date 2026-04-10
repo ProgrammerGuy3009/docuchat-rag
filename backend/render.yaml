@@ -1,0 +1,27 @@
+# render.yaml — Infrastructure as Code for Render.com
+# Docs: https://render.com/docs/blueprint-spec
+
+services:
+  - type: web
+    name: docuchat-rag-api
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PINECONE_API_KEY
+        sync: false  # must be set manually in Render dashboard
+      - key: GROQ_API_KEY
+        sync: false
+      - key: LANGCHAIN_TRACING_V2
+        value: "true"
+      - key: LANGCHAIN_API_KEY
+        sync: false
+      - key: LANGCHAIN_PROJECT
+        value: docuchat-rag
+      - key: FRONTEND_URL
+        sync: false  # set to your Vercel URL after deploying frontend
+      - key: RENDER_EXTERNAL_URL
+        sync: false  # set to your Render service URL (e.g. https://docuchat-rag-api.onrender.com)
+    healthCheckPath: /
+    autoDeploy: true

@@ -1,11 +1,13 @@
 # --- GLOBAL IGNORES ---
 .DS_Store
 .env
+*.pyc
 
 # --- BACKEND IGNORES ---
 backend/venv/
 backend/__pycache__/
 backend/.env
+backend/fastembed_cache/
 
 # --- FRONTEND IGNORES ---
 frontend/node_modules/

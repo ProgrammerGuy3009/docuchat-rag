@@ -3,6 +3,9 @@ import axios from "axios";
 import { Send, Upload, FileText, Bot, User, Sparkles, X, Menu } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 
+// Dynamic API URL — reads from env at build time, falls back to localhost
+const API_URL = import.meta.env.VITE_API_URL || "http://127.0.0.1:8000";
+
 export default function App() {
   const [messages, setMessages] = useState([
     { role: "bot", text: "Hello! I'm your RAG Assistant. Upload a PDF to get started." }
@@ -27,7 +30,7 @@ export default function App() {
     formData.append("file", file);
 
     try {
-      await axios.post("http://127.0.0.1:8000/upload-pdf/", formData);
+      await axios.post(`${API_URL}/upload-pdf/`, formData);
       setMessages(prev => [...prev, { role: "bot", text: "✅ PDF indexed successfully! Ask me anything about it." }]);
     } catch (error) {
       console.error("Upload failed", error);
@@ -46,7 +49,7 @@ export default function App() {
     setLoading(true);
 
     try {
-      const response = await axios.post("http://127.0.0.1:8000/chat/", { question: input });
+      const response = await axios.post(`${API_URL}/chat/`, { question: input });
       const botMessage = { role: "bot", text: response.data.answer };
       setMessages((prev) => [...prev, botMessage]);
     } catch (error) {
