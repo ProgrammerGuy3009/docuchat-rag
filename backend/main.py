@@ -20,7 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from groq import AsyncGroq
 from pinecone import Pinecone
 from pydantic import BaseModel, Field
-from pypdf import PdfReader
+import fitz  # PyMuPDF
 
 # ---------------------------------------------------------------------------
 # LangSmith Tracing — automatically enabled when env vars are set
@@ -265,28 +265,33 @@ async def upload_pdf(
     logger.info(f"📄 Upload started: {file.filename}")
 
     try:
-        # 1. Read and extract text
+        # 1. Parsing Step
         contents = await file.read()
-        reader = PdfReader(io.BytesIO(contents))
-        full_text = "\n".join(
-            page.extract_text() or "" for page in reader.pages
-        )
+        doc = fitz.open(stream=contents, filetype="pdf")
+        full_text = "\n".join(page.get_text() for page in doc)
+        
+        t1 = time.time()
+        logger.info(f"PDF Extraction took: {t1 - start_time:.2f} seconds")
 
         if not full_text.strip():
             raise HTTPException(status_code=400, detail="PDF appears to contain no extractable text.")
 
-        page_count = len(reader.pages)
+        page_count = len(doc)
         logger.info(f"   Pages: {page_count} | Characters: {len(full_text):,}")
 
-        # 2. Chunk the text
+        # 2. Chunking Step
         chunks = chunk_text(full_text)
+        t2 = time.time()
+        logger.info(f"Chunking took: {t2 - t1:.2f} seconds")
         logger.info(f"   Chunks created: {len(chunks)}")
 
-        # 3. Generate embeddings locally (runs in threadpool to not block event loop)
+        # 3. Embedding Step (Usually the slowest part)
         embeddings = await asyncio.to_thread(generate_embeddings, chunks)
+        t3 = time.time()
+        logger.info(f"FastEmbed CPU math took: {t3 - t2:.2f} seconds")
         logger.info(f"   Embeddings generated: {len(embeddings)}")
 
-        # 4. Upsert to Pinecone in batches of 100
+        # 4. Pinecone Upload Step
         batch_size = 100
         for i in range(0, len(chunks), batch_size):
             batch_vectors = []
@@ -301,6 +306,9 @@ async def upload_pdf(
                     },
                 })
             pinecone_index.upsert(vectors=batch_vectors, namespace=session_id)
+
+        t4 = time.time()
+        logger.info(f"Pinecone Network Upload took: {t4 - t3:.2f} seconds")
 
         elapsed = round(time.time() - start_time, 2)
         logger.info(f"✅ Upload complete: {file.filename} in {elapsed}s")
