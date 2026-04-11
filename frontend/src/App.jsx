@@ -42,27 +42,8 @@ export default function App() {
   const [uploading, setUploading] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   
-  const [uploadStep, setUploadStep] = useState(0);
-  const loadingSteps = [
-    { title: "Uploading...", desc: "Transferring file securely" },
-    { title: "Reading PDF...", desc: "Extracting raw text via PyMuPDF" },
-    { title: "Chunking Data...", desc: "Analyzing segments of text" },
-    { title: "Generating Vectors...", desc: "Processing 384-dimensional arrays" },
-    { title: "Syncing Knowledge Base...", desc: "Uploading to Pinecone serverless DB" }
-  ];
-
-  useEffect(() => {
-    let interval;
-    if (uploading) {
-      setUploadStep(0);
-      interval = setInterval(() => {
-        setUploadStep((prev) => (prev < loadingSteps.length - 1 ? prev + 1 : prev));
-      }, 3500);
-    } else {
-      setUploadStep(0);
-    }
-    return () => clearInterval(interval);
-  }, [uploading]);
+  const [uploadStep, setUploadStep] = useState("");
+  const [uploadDetail, setUploadDetail] = useState("");
 
   const [sessionId, setSessionId] = useState(() => Math.random().toString(36).substring(2, 10));
 
@@ -84,22 +65,63 @@ export default function App() {
     if (!selectedFile) return;
     setFile(selectedFile);
     setUploading(true);
+    setUploadStep("Uploading...");
+    setUploadDetail("Transferring file securely");
     
     const formData = new FormData();
     formData.append("file", selectedFile);
     formData.append("session_id", sessionId);
 
     try {
-      await axios.post(`${API_URL}/upload-pdf/`, formData);
+      const res = await axios.post(`${API_URL}/upload-pdf/`, formData);
+      const jobId = res.data.job_id;
+
+      // Subscribe to real-time SSE progress stream
+      const evtSource = new EventSource(`${API_URL}/ingestion-progress/${jobId}`);
       
-      setMessages(prev => [...prev, { 
-        role: "bot", 
-        text: `Document "${selectedFile.name}" has been successfully indexed. I've processed the context into Pinecone. How can I help you analyze it?` 
-      }]);
+      evtSource.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+        
+        if (data.step === "complete" || data.step === "result") {
+          evtSource.close();
+          setUploading(false);
+          const detail = data.step === "result" ? data.detail : {};
+          setMessages(prev => [...prev, { 
+            role: "bot", 
+            text: `✅ Document "${selectedFile.name}" indexed successfully!\n\n📊 **${detail.pages || '?'} pages** processed into **${detail.chunks_stored || '?'} chunks** in **${detail.processing_time_seconds || '?'}s**. How can I help you analyze it?` 
+          }]);
+          return;
+        }
+
+        if (data.step === "error") {
+          evtSource.close();
+          setUploading(false);
+          setMessages(prev => [...prev, { role: "bot", text: `Error during processing: ${data.detail}` }]);
+          return;
+        }
+
+        // Update live progress
+        const stepNames = {
+          started: "Starting...",
+          vision: "🖼️ Analyzing Images...",
+          summarizing: "🧬 Generating DNA Summary...",
+          extracting: "📄 Extracting Text...",
+          embedding: "🧮 Generating Vectors...",
+          uploading: "☁️ Syncing to Database..."
+        };
+        setUploadStep(stepNames[data.step] || data.step);
+        setUploadDetail(data.detail);
+      };
+
+      evtSource.onerror = () => {
+        evtSource.close();
+        setUploading(false);
+        setMessages(prev => [...prev, { role: "bot", text: "Error: Lost connection to ingestion stream." }]);
+      };
+
     } catch (error) {
       console.error("Upload failed", error);
       setMessages(prev => [...prev, { role: "bot", text: "Error: Failed to process the document. Please check your backend connection." }]);
-    } finally {
       setUploading(false);
     }
   };
@@ -228,10 +250,10 @@ export default function App() {
                     )}
                     
                     <span className="text-sm font-medium text-zinc-300">
-                      {uploading ? loadingSteps[uploadStep].title : file ? file.name : "Upload PDF"}
+                      {uploading ? uploadStep : file ? file.name : "Upload PDF"}
                     </span>
                     <span className="text-xs text-zinc-600 mt-1">
-                      {uploading ? loadingSteps[uploadStep].desc : file ? "Ready to query" : "PDF format only"}
+                      {uploading ? uploadDetail : file ? "Ready to query" : "Any size PDF"}
                     </span>
                     
                     {uploading && (

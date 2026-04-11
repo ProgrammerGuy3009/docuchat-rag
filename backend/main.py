@@ -1,8 +1,9 @@
 """
-DocuChat RAG Backend — Production Build (V5)
+DocuChat RAG Backend — V5 Infinite Edition
 =============================================
 Stack: FastAPI + Pinecone + Groq (Llama-3) + VoyageAI + Gemini + LangSmith + RAGAS
-Features: Contextual Chunking, HyDE, Async Parallelism, Semantic Cache, Reranker, PII Scrubbing
+Features: Wave Ingestion, Adaptive RAG, Contextual Chunking, HyDE, Async Parallelism,
+          Semantic Cache, Reranker, PII Scrubbing, Gemini Deep Path, SSE Progress
 """
 
 import asyncio
@@ -10,6 +11,7 @@ import io
 import logging
 import os
 import time
+import uuid
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -17,8 +19,8 @@ import httpx
 import re
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, UploadFile, Form
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, File, HTTPException, UploadFile, Form, BackgroundTasks
+from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from groq import AsyncGroq
 from pinecone import Pinecone
@@ -81,6 +83,13 @@ pinecone_index = pc.Index(PINECONE_INDEX_NAME)
 groq_client = AsyncGroq(api_key=GROQ_API_KEY)
 voyage_client = voyageai.AsyncClient(api_key=VOYAGE_API_KEY)
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+
+# Server-side state for background ingestion and Gemini Deep Path
+ingestion_jobs: dict = {}    # job_id → {status, progress messages, etc.}
+document_cache: dict = {}    # session_id → full extracted text (for Gemini Deep Path)
+
+# Backpressure: limit concurrent VoyageAI calls
+VOYAGE_SEMAPHORE = asyncio.Semaphore(3)
 
 
 # ---------------------------------------------------------------------------
@@ -280,6 +289,41 @@ async def generate_embeddings(texts: list[str], input_type: str = "document") ->
     return result.embeddings
 
 
+async def embed_with_backpressure(chunks: list[str], input_type: str = "document", batch_size: int = 8) -> list[list[float]]:
+    """
+    Rate-limited embedding with Semaphore + exponential backoff.
+    Processes chunks in micro-batches to avoid 429 errors.
+    """
+    all_embeddings = []
+
+    async def _embed_batch(batch: list[str]) -> list[list[float]]:
+        async with VOYAGE_SEMAPHORE:
+            for attempt in range(4):  # max 3 retries
+                try:
+                    result = await voyage_client.embed(batch, model="voyage-3", input_type=input_type)
+                    return result.embeddings
+                except Exception as e:
+                    if "429" in str(e) or "rate" in str(e).lower():
+                        wait = 2 ** attempt  # 1s, 2s, 4s, 8s
+                        logger.warning(f"⏳ VoyageAI rate-limited, backing off {wait}s...")
+                        await asyncio.sleep(wait)
+                    else:
+                        raise
+            raise Exception("VoyageAI rate limit exceeded after 4 retries")
+
+    # Fire micro-batches concurrently (limited by semaphore)
+    tasks = []
+    for i in range(0, len(chunks), batch_size):
+        batch = chunks[i:i + batch_size]
+        tasks.append(_embed_batch(batch))
+
+    results = await asyncio.gather(*tasks)
+    for batch_result in results:
+        all_embeddings.extend(batch_result)
+
+    return all_embeddings
+
+
 @traceable(name="search_pinecone")
 def search_pinecone(query_vector: list[float], top_k: int = 15, namespace: str = "") -> list[str]:
     """Query Pinecone and return list of context document strings."""
@@ -351,135 +395,219 @@ def health_check():
     return {
         "status": "online",
         "service": "DocuChat RAG API",
-        "version": "2.0.0",
-        "model": "llama-3.1-8b-instant",
+        "version": "5.0.0",
+        "model": "llama-3.3-70b-versatile",
+        "features": ["wave-ingestion", "adaptive-rag", "hyde", "reranker", "semantic-cache", "pii-scrubbing"]
     }
 
 
 @app.post("/upload-pdf/", tags=["Documents"])
-@traceable(name="upload_pdf")
 async def upload_pdf(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     session_id: str = Form(..., description="Unique session ID for namespace")
 ):
     """
-    Upload a PDF → extract text → chunk → embed → store in Pinecone.
-    Fully async-safe and handles 300+ page documents efficiently.
+    Upload a PDF → return 202 immediately → process in background via waves.
+    Subscribe to /ingestion-progress/{job_id} for real-time SSE updates.
     """
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are accepted.")
 
+    contents = await file.read()
+    job_id = str(uuid.uuid4())[:8]
+
+    # Initialize job tracking
+    ingestion_jobs[job_id] = {
+        "status": "processing",
+        "filename": file.filename,
+        "progress": [],
+        "result": None
+    }
+
+    # Spawn background task
+    background_tasks.add_task(
+        _run_ingestion, job_id, contents, file.filename, session_id
+    )
+
+    return JSONResponse(
+        status_code=202,
+        content={
+            "job_id": job_id,
+            "status": "processing",
+            "message": "Ingestion started. Subscribe to /ingestion-progress/{job_id} for live updates.",
+        }
+    )
+
+
+async def _run_ingestion(job_id: str, contents: bytes, filename: str, session_id: str):
+    """Wave-based background ingestion — processes 25 pages at a time to stay under 512MB RAM."""
+    WAVE_SIZE = 25
     start_time = time.time()
-    logger.info(f"📄 Upload started: {file.filename}")
+    job = ingestion_jobs[job_id]
+
+    def _progress(step: str, detail: str):
+        job["progress"].append({"step": step, "detail": detail, "ts": time.time()})
+        logger.info(f"📄 [{job_id}] {step}: {detail}")
 
     try:
-        # 1. Parsing Step (Text + Multimodal Images)
-        contents = await file.read()
         doc = fitz.open(stream=contents, filetype="pdf")
-        
-        text_parts = []
+        total_pages = len(doc)
+        _progress("started", f"Processing {filename} ({total_pages} pages)")
+
+        # ── Phase 1: Extract text from first wave for DNA summary ──
+        first_wave_text_parts = []
+        for i in range(min(WAVE_SIZE, total_pages)):
+            first_wave_text_parts.append(doc[i].get_text())
+        first_wave_text = "\n".join(first_wave_text_parts)
+
+        # Vision extraction on first wave
         vision_tasks = []
-        for page_num in range(len(doc)):
-            page = doc[page_num]
-            text_parts.append(page.get_text())
-            
-            # Extract images for Voyage text-injection
-            for img in page.get_images(full=True):
+        for i in range(min(WAVE_SIZE, total_pages)):
+            for img in doc[i].get_images(full=True):
                 try:
-                    xref = img[0]
-                    base_image = doc.extract_image(xref)
-                    image_bytes = base_image["image"]
-                    b64_image = base64.b64encode(image_bytes).decode('utf-8')
+                    base_image = doc.extract_image(img[0])
+                    b64_image = base64.b64encode(base_image["image"]).decode('utf-8')
                     vision_tasks.append(
                         groq_client.chat.completions.create(
                             model="llama-3.2-11b-vision-preview",
-                            messages=[{
-                                "role": "user",
-                                "content": [
-                                    {"type": "text", "text": "Describe this image, chart, or graph in extreme detail so it can be numerically embedded into a database. Do not include introductory text."},
-                                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"}}
-                                ]
-                            }],
+                            messages=[{"role": "user", "content": [
+                                {"type": "text", "text": "Describe this image/chart in extreme detail for database embedding. No intro text."},
+                                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"}}
+                            ]}],
                             max_tokens=300
                         )
                     )
                 except Exception:
                     pass
-                    
-        vision_responses = await asyncio.gather(*vision_tasks, return_exceptions=True)
-        for resp in vision_responses:
-            if not isinstance(resp, Exception) and resp.choices:
-                text_parts.append(f"\n[IMAGE DATAPOINT]\n{resp.choices[0].message.content}\n")
 
-        full_text = pii_scrubber("\n".join(text_parts))
-        
-        t1 = time.time()
-        logger.info(f"PDF Extraction took: {t1 - start_time:.2f} seconds")
+        if vision_tasks:
+            _progress("vision", f"Analyzing {len(vision_tasks)} images via Vision AI...")
+            vision_responses = await asyncio.gather(*vision_tasks, return_exceptions=True)
+            for resp in vision_responses:
+                if not isinstance(resp, Exception) and resp.choices:
+                    first_wave_text += f"\n[IMAGE DATAPOINT]\n{resp.choices[0].message.content}\n"
 
-        if not full_text.strip():
-            raise HTTPException(status_code=400, detail="PDF appears to contain no extractable text.")
+        # ── Phase 2: Generate DNA summary ──
+        _progress("summarizing", "Generating document DNA summary...")
+        doc_summary = await generate_document_summary(first_wave_text)
+        _progress("summarizing", f"DNA: {doc_summary[:80]}...")
 
-        page_count = len(doc)
-        logger.info(f"   Pages: {page_count} | Characters: {len(full_text):,}")
+        # ── Phase 3: Wave-based processing ──
+        total_chunks_stored = 0
+        total_waves = (total_pages + WAVE_SIZE - 1) // WAVE_SIZE
+        full_text_accumulator = []  # for Gemini Deep Path cache
 
-        # 2. Contextual Chunking Step (DNA Summary + Chunking)
-        doc_summary = await generate_document_summary(full_text)
-        logger.info(f"📝 Document DNA: {doc_summary[:80]}...")
+        for wave_num in range(total_waves):
+            wave_start = wave_num * WAVE_SIZE
+            wave_end = min(wave_start + WAVE_SIZE, total_pages)
+            _progress("extracting", f"Wave {wave_num + 1}/{total_waves} — pages {wave_start + 1}-{wave_end}")
 
-        raw_chunks = chunk_text(full_text)
-        # Prepend the DNA summary to every single chunk
-        chunks = [f"[DOCUMENT CONTEXT]: {doc_summary}\n\n{chunk}" for chunk in raw_chunks]
-        t2 = time.time()
-        logger.info(f"Contextual Chunking took: {t2 - t1:.2f} seconds")
-        logger.info(f"   Chunks created: {len(chunks)}")
+            # Extract text for this wave
+            wave_text_parts = []
+            for page_idx in range(wave_start, wave_end):
+                page_text = doc[page_idx].get_text()
+                wave_text_parts.append(page_text)
+            
+            wave_text = pii_scrubber("\n".join(wave_text_parts))
+            full_text_accumulator.append(wave_text)
 
-        # 3. Embedding Step (Voyage AI)
-        embeddings = await generate_embeddings(chunks, input_type="document")
-        t3 = time.time()
-        logger.info(f"VoyageAI Embedding took: {t3 - t2:.2f} seconds")
-        logger.info(f"   Embeddings generated: {len(embeddings)}")
+            # Chunk this wave's text
+            raw_chunks = chunk_text(wave_text)
+            if not raw_chunks:
+                continue
 
-        # 4. Pinecone Upload Step
-        batch_size = 100
-        for i in range(0, len(chunks), batch_size):
-            batch_vectors = []
-            for j in range(i, min(i + batch_size, len(chunks))):
-                batch_vectors.append({
-                    "id": f"{file.filename}-chunk-{j}",
-                    "values": embeddings[j],
-                    "metadata": {
-                        "text": chunks[j],
-                        "source": file.filename,
-                        "chunk_index": j,
-                    },
-                })
-            pinecone_index.upsert(vectors=batch_vectors, namespace=session_id)
+            # Prepend DNA to every chunk
+            chunks = [f"[DOCUMENT CONTEXT]: {doc_summary}\n\n{chunk}" for chunk in raw_chunks]
 
-        t4 = time.time()
-        logger.info(f"Pinecone Network Upload took: {t4 - t3:.2f} seconds")
+            # Embed with backpressure
+            _progress("embedding", f"Embedding {len(chunks)} chunks (wave {wave_num + 1})...")
+            embeddings = await embed_with_backpressure(chunks, input_type="document")
+
+            # Upsert to Pinecone
+            _progress("uploading", f"Syncing wave {wave_num + 1} to Pinecone...")
+            batch_size = 100
+            for i in range(0, len(chunks), batch_size):
+                batch_vectors = []
+                for j in range(i, min(i + batch_size, len(chunks))):
+                    global_idx = total_chunks_stored + j
+                    batch_vectors.append({
+                        "id": f"{filename}-chunk-{global_idx}",
+                        "values": embeddings[j],
+                        "metadata": {
+                            "text": chunks[j],
+                            "source": filename,
+                            "chunk_index": global_idx,
+                        },
+                    })
+                pinecone_index.upsert(vectors=batch_vectors, namespace=session_id)
+
+            total_chunks_stored += len(chunks)
+
+            # Free memory from this wave
+            del wave_text_parts, wave_text, raw_chunks, chunks, embeddings
+
+        # Cache full text for Gemini Deep Path
+        document_cache[session_id] = "\n".join(full_text_accumulator)
 
         elapsed = round(time.time() - start_time, 2)
-        logger.info(f"✅ Upload complete: {file.filename} in {elapsed}s")
+        _progress("complete", f"Done in {elapsed}s — {total_chunks_stored} chunks stored")
 
-        return {
-            "filename": file.filename,
-            "status": "Successfully indexed!",
-            "pages": page_count,
-            "chunks_stored": len(chunks),
+        job["status"] = "complete"
+        job["result"] = {
+            "filename": filename,
+            "pages": total_pages,
+            "chunks_stored": total_chunks_stored,
             "processing_time_seconds": elapsed,
         }
 
-    except HTTPException:
-        raise
+        doc.close()
+        logger.info(f"✅ [{job_id}] Upload complete: {filename} in {elapsed}s")
+
     except Exception as e:
-        logger.error(f"❌ Upload failed: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
+        logger.error(f"❌ [{job_id}] Ingestion failed: {e}", exc_info=True)
+        job["status"] = "failed"
+        job["progress"].append({"step": "error", "detail": str(e), "ts": time.time()})
+
+
+@app.get("/ingestion-progress/{job_id}", tags=["Documents"])
+async def ingestion_progress(job_id: str):
+    """
+    SSE endpoint — frontend subscribes to get real-time ingestion progress.
+    """
+    if job_id not in ingestion_jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    async def event_stream():
+        import json
+        last_idx = 0
+        while True:
+            job = ingestion_jobs.get(job_id)
+            if not job:
+                break
+
+            # Stream any new progress entries
+            progress = job["progress"]
+            while last_idx < len(progress):
+                entry = progress[last_idx]
+                yield f"data: {json.dumps(entry)}\n\n"
+                last_idx += 1
+
+            if job["status"] in ("complete", "failed"):
+                # Send final result
+                if job["result"]:
+                    yield f"data: {json.dumps({'step': 'result', 'detail': job['result']})}\n\n"
+                break
+
+            await asyncio.sleep(0.5)
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 @app.post("/chat/", tags=["Chat"])
 @traceable(name="chat")
 async def chat(request: ChatRequest):
-    """RAG V5: Router → HyDE + Embed (parallel) → Cache → Pinecone → Rerank → 70B Stream"""
+    """V5 Infinite: Router → HyDE + Embed → Cache → Search → Rerank → Adaptive RAG (Fast or Deep Path)"""
     start_time = time.time()
 
     user_query = pii_scrubber(request.question)
@@ -558,11 +686,52 @@ async def chat(request: ChatRequest):
         async def empty_response(): yield "I don't have any documents indexed yet. Please upload a PDF first."
         return StreamingResponse(empty_response(), media_type="text/event-stream")
 
-    # ── Phase 4: Rerank the rough top 15 down to the absolute best 5 ──
+    # ── Phase 4: Rerank + Adaptive RAG Decision ──
     rerank_result = await voyage_client.rerank(user_query, docs, model="rerank-2", top_k=5)
+    top_score = rerank_result.results[0].relevance_score if rerank_result.results else 0
     final_context = "\n---\n".join([r.document for r in rerank_result.results])
 
-    # 5. Build Llama-3 System Prompt
+    logger.info(f"🎯 Reranker top score: {top_score:.3f}")
+
+    # ── Phase 5: Adaptive RAG — choose Fast Path or Deep Path ──
+    if top_score < 0.5 and gemini_client and request.session_id in document_cache:
+        # DEEP PATH: Reranker isn't confident → send full doc to Gemini
+        logger.info(f"🧠 Deep Path activated (score {top_score:.3f} < 0.5) — routing to Gemini")
+        full_doc_text = document_cache[request.session_id]
+        # Truncate to ~900K chars (~450K tokens) to stay within Gemini's context
+        truncated = full_doc_text[:900_000]
+
+        gemini_prompt = (
+            f"You are DocuChat, a precise document analyst. Answer the user's question based ONLY on the document below.\n\n"
+            f"DOCUMENT:\n{truncated}\n\n"
+            f"USER QUESTION: {user_query}\n\n"
+            f"If the answer is not in the document, say: \"I don't find that information in the uploaded document.\""
+        )
+
+        gemini_resp = await asyncio.to_thread(
+            gemini_client.models.generate_content,
+            model="gemini-2.5-flash-preview-05-20",
+            contents=gemini_prompt
+        )
+        deep_answer = gemini_resp.text
+
+        # Cache this deep answer too
+        pinecone_index.upsert(
+            vectors=[{
+                "id": f"cache-deep-{int(time.time())}",
+                "values": blended_vector,
+                "metadata": {"answer": deep_answer}
+            }],
+            namespace="semantic-cache"
+        )
+
+        async def stream_deep():
+            for word in deep_answer.split(" "):
+                yield word + " "
+                await asyncio.sleep(0.02)
+        return StreamingResponse(stream_deep(), media_type="text/event-stream")
+
+    # FAST PATH: Reranker is confident → use Groq 70B
     system_prompt = (
         "You are DocuChat, a highly precise AI assistant. "
         "You may respond politely to basic conversational greetings. "
@@ -577,7 +746,7 @@ async def chat(request: ChatRequest):
     
     messages.append({"role": "user", "content": f"Context from Document:\n{final_context}\n\nUser Question:\n{user_query}"})
 
-    # 6. Stream to Frontend using massive 70B model
+    # Stream to Frontend using massive 70B model
     completion = await groq_client.chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=messages,
@@ -594,12 +763,12 @@ async def chat(request: ChatRequest):
                 answer_parts.append(delta)
                 yield delta
                 
-        # 7. Add generated full answer to Semantic Cache for future identical questions
+        # Cache the answer for future identical questions
         full_answer = "".join(answer_parts)
         pinecone_index.upsert(
             vectors=[{
                 "id": f"cache-{int(time.time())}",
-                "values": query_vector,
+                "values": blended_vector,
                 "metadata": {"answer": full_answer}
             }],
             namespace="semantic-cache"
