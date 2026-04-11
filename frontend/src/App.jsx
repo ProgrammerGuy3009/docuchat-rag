@@ -260,7 +260,14 @@ export default function App() {
                       <div className="w-full bg-zinc-800 rounded-full h-1 mt-4 mb-1 overflow-hidden">
                         <div 
                           className="bg-zinc-400 h-1 rounded-full transition-all duration-1000 ease-in-out" 
-                          style={{ width: `${((uploadStep + 1) / loadingSteps.length) * 100}%` }}
+                          style={{ 
+                            width: uploadStep === "Starting..." ? "15%" :
+                                   uploadStep === "🖼️ Analyzing Images..." ? "30%" :
+                                   uploadStep === "🧬 Generating DNA Summary..." ? "45%" :
+                                   uploadStep === "📄 Extracting Text..." ? "60%" :
+                                   uploadStep === "🧮 Generating Vectors..." ? "75%" :
+                                   uploadStep === "☁️ Syncing to Database..." ? "90%" : "100%"
+                          }}
                         ></div>
                       </div>
                     )}

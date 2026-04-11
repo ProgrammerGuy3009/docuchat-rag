@@ -239,7 +239,7 @@ async def generate_document_summary(full_text: str) -> str:
             logger.info("📝 Contextual summary via Gemini Latest (large doc)")
             resp = await asyncio.to_thread(
                 gemini_client.models.generate_content,
-                model="gemini-2.5-flash-preview-05-20",
+                model="gemini-2.5-flash",
                 contents=summary_prompt
             )
             return resp.text.strip()
@@ -710,7 +710,7 @@ async def chat(request: ChatRequest):
 
         gemini_resp = await asyncio.to_thread(
             gemini_client.models.generate_content,
-            model="gemini-2.5-flash-preview-05-20",
+            model="gemini-2.5-flash",
             contents=gemini_prompt
         )
         deep_answer = gemini_resp.text
