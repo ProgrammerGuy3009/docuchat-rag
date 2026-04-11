@@ -649,20 +649,20 @@ async def chat(request: ChatRequest):
                 if delta: yield delta
         return StreamingResponse(fast_stream(), media_type="text/event-stream")
 
-    # ── Phase 2: HyDE + Embed fired CONCURRENTLY via asyncio.gather ──
-    async def _embed_query():
-        result = await voyage_client.embed([user_query], model="voyage-3", input_type="query")
-        return result.embeddings[0]
-
-    async def _generate_hyde_embedding():
-        hyde_text = await generate_hyde(user_query)
-        result = await voyage_client.embed([hyde_text], model="voyage-3", input_type="query")
-        return result.embeddings[0]
-
-    query_vector, hyde_vector = await asyncio.gather(
-        _embed_query(),
-        _generate_hyde_embedding()
+    # ── Phase 2: HyDE generation + Single Batch Embedding ──
+    # Generate HyDE text first using Groq
+    hyde_text = await generate_hyde(user_query)
+    
+    # Embed BOTH the original query and the HyDE text in a SINGLE Voyage API call.
+    # This cuts our embedding requests in half to stay safely under the 3 RPM free limit!
+    embed_result = await voyage_client.embed(
+        [user_query, hyde_text], 
+        model="voyage-3", 
+        input_type="query"
     )
+    
+    query_vector = embed_result.embeddings[0]
+    hyde_vector = embed_result.embeddings[1]
 
     # Blend the original query vector with the HyDE vector (weighted average)
     blended_vector = [
