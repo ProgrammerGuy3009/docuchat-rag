@@ -1,7 +1,8 @@
 """
-DocuChat RAG Backend — Production Build
-========================================
-Stack: FastAPI + Pinecone + Groq (Llama-3) + FastEmbed + LangSmith + RAGAS
+DocuChat RAG Backend — Production Build (V5)
+=============================================
+Stack: FastAPI + Pinecone + Groq (Llama-3) + VoyageAI + Gemini + LangSmith + RAGAS
+Features: Contextual Chunking, HyDE, Async Parallelism, Semantic Cache, Reranker, PII Scrubbing
 """
 
 import asyncio
@@ -25,6 +26,7 @@ from pydantic import BaseModel, Field
 import fitz  # PyMuPDF
 import voyageai
 import base64
+from google import genai
 
 # ---------------------------------------------------------------------------
 # LangSmith Tracing — automatically enabled when env vars are set
@@ -52,6 +54,7 @@ PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "docuchat")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 VOYAGE_API_KEY = os.getenv("VOYAGE_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
 
 # Render gives us the external URL via this env var (or set it manually)
@@ -67,6 +70,9 @@ if not PINECONE_API_KEY or not GROQ_API_KEY or not VOYAGE_API_KEY:
         "Ensure PINECONE_API_KEY, VOYAGE_API_KEY, and GROQ_API_KEY are set in your .env file."
     )
 
+if not GEMINI_API_KEY:
+    logger.warning("⚠️  GEMINI_API_KEY not set — large document contextual chunking will fall back to Groq (truncated).")
+
 # ---------------------------------------------------------------------------
 # Global Clients (initialised once at startup)
 # ---------------------------------------------------------------------------
@@ -74,6 +80,7 @@ pc = Pinecone(api_key=PINECONE_API_KEY)
 pinecone_index = pc.Index(PINECONE_INDEX_NAME)
 groq_client = AsyncGroq(api_key=GROQ_API_KEY)
 voyage_client = voyageai.AsyncClient(api_key=VOYAGE_API_KEY)
+gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +177,8 @@ def pii_scrubber(text: str) -> str:
     # 3. Phone Numbers
     text = re.sub(r'\+?\d{1,3}[-.\s]?\(?\d{2,3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b', '[REDACTED_PHONE]', text)
     return text
+
+
 def chunk_text(text: str, chunk_size: int = 500, overlap: int = 100) -> list[str]:
     """
     Split text into overlapping chunks.
@@ -185,6 +194,83 @@ def chunk_text(text: str, chunk_size: int = 500, overlap: int = 100) -> list[str
             chunks.append(chunk)
         start += chunk_size - overlap
     return chunks
+
+
+@traceable(name="generate_document_summary")
+async def generate_document_summary(full_text: str) -> str:
+    """
+    Payload-Aware Contextual Chunking:
+    - Small docs (≤6000 chars / ~5 pages): Groq 8B summarizes instantly.
+    - Large docs (>6000 chars): Gemini Latest handles the full context.
+    Returns a 1-2 sentence "DNA" summary to prepend to every chunk.
+    """
+    summary_prompt = (
+        "You are a document summarizer. Read the following document and produce "
+        "a single, dense sentence that captures the document's subject, purpose, "
+        "and key entities. This sentence will be prepended to every chunk of the "
+        "document to provide global context. Output ONLY the summary sentence, nothing else.\n\n"
+        f"DOCUMENT:\n{full_text[:50000]}"
+    )
+
+    SMALL_DOC_THRESHOLD = 6000  # ~5 pages of text
+
+    if len(full_text) <= SMALL_DOC_THRESHOLD:
+        # Small doc → Groq 8B (fast, no external dependency)
+        logger.info("📝 Contextual summary via Groq 8B (small doc)")
+        resp = await groq_client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[{"role": "user", "content": summary_prompt}],
+            max_tokens=150,
+            temperature=0.0
+        )
+        return resp.choices[0].message.content.strip()
+    else:
+        # Large doc → Gemini Latest (1M token context window)
+        if gemini_client:
+            logger.info("📝 Contextual summary via Gemini Latest (large doc)")
+            resp = await asyncio.to_thread(
+                gemini_client.models.generate_content,
+                model="gemini-2.5-flash-preview-05-20",
+                contents=summary_prompt
+            )
+            return resp.text.strip()
+        else:
+            # Fallback: Groq with truncated text if no Gemini key
+            logger.warning("📝 Gemini unavailable, falling back to Groq 8B (truncated)")
+            truncated_prompt = (
+                "You are a document summarizer. Read the following document and produce "
+                "a single, dense sentence that captures the document's subject, purpose, "
+                "and key entities. Output ONLY the summary sentence.\n\n"
+                f"DOCUMENT:\n{full_text[:5500]}"
+            )
+            resp = await groq_client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[{"role": "user", "content": truncated_prompt}],
+                max_tokens=150,
+                temperature=0.0
+            )
+            return resp.choices[0].message.content.strip()
+
+
+@traceable(name="generate_hyde")
+async def generate_hyde(user_query: str) -> str:
+    """
+    HyDE (Hypothetical Document Embeddings):
+    Generate a hypothetical answer to improve vector search quality.
+    """
+    hyde_prompt = (
+        "You are a document assistant. Given this user question, write a short "
+        "hypothetical paragraph that would answer the question if it existed in a document. "
+        "Do NOT say 'I don't know'. Just write the hypothetical content as if it were real.\n\n"
+        f"Question: {user_query}"
+    )
+    resp = await groq_client.chat.completions.create(
+        model="llama-3.1-8b-instant",
+        messages=[{"role": "user", "content": hyde_prompt}],
+        max_tokens=200,
+        temperature=0.3
+    )
+    return resp.choices[0].message.content.strip()
 
 
 @traceable(name="generate_embeddings")
@@ -336,16 +422,21 @@ async def upload_pdf(
         page_count = len(doc)
         logger.info(f"   Pages: {page_count} | Characters: {len(full_text):,}")
 
-        # 2. Chunking Step
-        chunks = chunk_text(full_text)
+        # 2. Contextual Chunking Step (DNA Summary + Chunking)
+        doc_summary = await generate_document_summary(full_text)
+        logger.info(f"📝 Document DNA: {doc_summary[:80]}...")
+
+        raw_chunks = chunk_text(full_text)
+        # Prepend the DNA summary to every single chunk
+        chunks = [f"[DOCUMENT CONTEXT]: {doc_summary}\n\n{chunk}" for chunk in raw_chunks]
         t2 = time.time()
-        logger.info(f"Chunking took: {t2 - t1:.2f} seconds")
+        logger.info(f"Contextual Chunking took: {t2 - t1:.2f} seconds")
         logger.info(f"   Chunks created: {len(chunks)}")
 
         # 3. Embedding Step (Voyage AI)
         embeddings = await generate_embeddings(chunks, input_type="document")
         t3 = time.time()
-        logger.info(f"FastEmbed CPU math took: {t3 - t2:.2f} seconds")
+        logger.info(f"VoyageAI Embedding took: {t3 - t2:.2f} seconds")
         logger.info(f"   Embeddings generated: {len(embeddings)}")
 
         # 4. Pinecone Upload Step
@@ -388,12 +479,12 @@ async def upload_pdf(
 @app.post("/chat/", tags=["Chat"])
 @traceable(name="chat")
 async def chat(request: ChatRequest):
-    """RAG pipeline: Router → Cache Check → Embed → Pinecone Search → Voyage Rerank → 70B Llama-3 Stream"""
+    """RAG V5: Router → HyDE + Embed (parallel) → Cache → Pinecone → Rerank → 70B Stream"""
     start_time = time.time()
 
     user_query = pii_scrubber(request.question)
 
-    # 1. LLM Router (Triage & Compliance)
+    # ── Phase 1: Router (must complete first to decide the path) ──
     router_prompt = (
         "You are a routing logic system and compliance filter. The user has asked the following message: "
         f"'{user_query}'\n"
@@ -414,10 +505,12 @@ async def chat(request: ChatRequest):
         return StreamingResponse(redacted_stream(), media_type="text/event-stream")
 
     if "simple" in router_content:
-        # Bypass RAG entirely for conversational speed
         completion = await groq_client.chat.completions.create(
             model="llama-3.1-8b-instant",
-            messages=[{"role": "user", "content": user_query}],
+            messages=[
+                {"role": "system", "content": "You are DocuChat, an AI assistant strictly limited to analyzing uploaded documents. You may respond politely to basic conversational greetings. You MUST refuse to answer general knowledge questions (like 'Who is the president' or 'Tell me about America'). If a user asks a general fact, reply exactly with: 'I am specifically designed to only answer questions regarding the uploaded document.'"},
+                {"role": "user", "content": user_query}
+            ],
             temperature=0.7,
             max_tokens=500,
             stream=True
@@ -428,12 +521,32 @@ async def chat(request: ChatRequest):
                 if delta: yield delta
         return StreamingResponse(fast_stream(), media_type="text/event-stream")
 
-    # 2. Embed the Question
-    query_result = await voyage_client.embed([user_query], model="voyage-3", input_type="query")
-    query_vector = query_result.embeddings[0]
+    # ── Phase 2: HyDE + Embed fired CONCURRENTLY via asyncio.gather ──
+    async def _embed_query():
+        result = await voyage_client.embed([user_query], model="voyage-3", input_type="query")
+        return result.embeddings[0]
 
-    # 2. Semantic Cache Check
-    cached_answer = await asyncio.to_thread(check_semantic_cache, query_vector)
+    async def _generate_hyde_embedding():
+        hyde_text = await generate_hyde(user_query)
+        result = await voyage_client.embed([hyde_text], model="voyage-3", input_type="query")
+        return result.embeddings[0]
+
+    query_vector, hyde_vector = await asyncio.gather(
+        _embed_query(),
+        _generate_hyde_embedding()
+    )
+
+    # Blend the original query vector with the HyDE vector (weighted average)
+    blended_vector = [
+        (q * 0.4 + h * 0.6) for q, h in zip(query_vector, hyde_vector)
+    ]
+
+    # ── Phase 3: Cache Check + Pinecone Search (concurrent) ──
+    cached_answer, docs = await asyncio.gather(
+        asyncio.to_thread(check_semantic_cache, blended_vector),
+        asyncio.to_thread(search_pinecone, blended_vector, 15, request.session_id)
+    )
+
     if cached_answer:
         async def stream_cache():
             for word in cached_answer.split(" "):
@@ -441,16 +554,11 @@ async def chat(request: ChatRequest):
                 await asyncio.sleep(0.02)
         return StreamingResponse(stream_cache(), media_type="text/event-stream")
 
-    # 3. Search Pinecone for rough top 15
-    docs = await asyncio.to_thread(
-        search_pinecone, query_vector, 15, request.session_id
-    )
-
     if not docs:
         async def empty_response(): yield "I don't have any documents indexed yet. Please upload a PDF first."
         return StreamingResponse(empty_response(), media_type="text/event-stream")
 
-    # 4. Rerank using Voyage Reranker to get the absolute best top 5
+    # ── Phase 4: Rerank the rough top 15 down to the absolute best 5 ──
     rerank_result = await voyage_client.rerank(user_query, docs, model="rerank-2", top_k=5)
     final_context = "\n---\n".join([r.document for r in rerank_result.results])
 

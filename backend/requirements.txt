@@ -25,5 +25,8 @@ datasets
 langchain-groq
 langchain-core
 
+# --- Contextual Chunking (Gemini for large docs) ---
+google-genai
+
 # --- Async HTTP ---
 httpx
