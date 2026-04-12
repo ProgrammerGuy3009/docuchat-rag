@@ -714,6 +714,7 @@ async def chat(request: ChatRequest):
         )
 
         async def stream_deep():
+            yield "[MODE:DEEP]"
             for word in deep_answer.split(" "):
                 yield word + " "
                 await asyncio.sleep(0.02)
@@ -744,6 +745,7 @@ async def chat(request: ChatRequest):
     )
 
     async def stream_generator():
+        yield "[MODE:FAST]"
         answer_parts = []
         async for chunk in completion:
             delta = chunk.choices[0].delta.content

@@ -180,10 +180,21 @@ export default function App() {
         
         streamText += decoder.decode(value, { stream: true });
         
+        let currentMode = "fast";
+        let displayText = streamText;
+        if (streamText.includes("[MODE:DEEP]")) {
+            currentMode = "deep";
+            displayText = streamText.replace("[MODE:DEEP]", "");
+        } else if (streamText.includes("[MODE:FAST]")) {
+            currentMode = "fast";
+            displayText = streamText.replace("[MODE:FAST]", "");
+        }
+
         // Update the very last message in the state with the ongoing stream text
         setMessages((prev) => {
           const newMessages = [...prev];
-          newMessages[newMessages.length - 1].text = streamText;
+          newMessages[newMessages.length - 1].text = displayText;
+          newMessages[newMessages.length - 1].mode = currentMode;
           return newMessages;
         });
       }
@@ -197,6 +208,9 @@ export default function App() {
       setLoading(false);
     }
   };
+
+  const lastBotMessage = messages.slice().reverse().find(m => m.role === "bot");
+  const isDeepMode = lastBotMessage?.mode === "deep";
 
   return (
     <div className="flex h-screen bg-[#09090b] text-zinc-300 font-sans overflow-hidden selection:bg-zinc-800 selection:text-white">
@@ -377,18 +391,24 @@ export default function App() {
                 className={`flex gap-5 ${msg.role === "user" ? "flex-row-reverse" : "flex-row"}`}
               >
                 {/* Visual Identifier (Avatar) */}
-                <div className={`w-8 h-8 rounded-lg flex items-center justify-center shrink-0 border ${
+                <div className={`w-8 h-8 rounded-lg flex items-center justify-center shrink-0 border transition-all ${
                   msg.role === "user" 
                     ? "bg-zinc-800 border-zinc-700 text-zinc-400" 
-                    : "bg-white text-black border-zinc-200 shadow-sm"
+                    : msg.mode === "deep" 
+                      ? "bg-purple-500/20 border-purple-500/50 text-purple-400 shadow-[0_0_15px_-3px_rgba(168,85,247,0.4)]"
+                      : "bg-white text-black border-zinc-200 shadow-sm"
                 }`}>
-                  {msg.role === "bot" ? <Command size={14} strokeWidth={2.5} /> : <User size={14} />}
+                  {msg.role === "bot" ? (
+                    msg.mode === "deep" ? <Command size={14} strokeWidth={2.5} className="animate-pulse" /> : <Command size={14} strokeWidth={2.5} />
+                  ) : <User size={14} />}
                 </div>
 
                 {/* Message Body */}
                 <div className={`flex flex-col max-w-[85%] ${msg.role === "user" ? "items-end" : "items-start"}`}>
-                  <span className="text-[10px] font-bold text-zinc-600 mb-1.5 uppercase tracking-widest">
-                    {msg.role === "bot" ? "Assistant" : "Query"}
+                  <span className={`text-[10px] font-bold mb-1.5 uppercase tracking-widest flex items-center gap-1.5 transition-colors ${msg.mode === "deep" ? "text-purple-400" : "text-zinc-600"}`}>
+                    {msg.role === "bot" ? (
+                      msg.mode === "deep" ? <>Deep Analysis</> : "Assistant"
+                    ) : "Query"}
                   </span>
                   <div className={`text-[15px] leading-relaxed tracking-tight ${
                     msg.role === "user" 
@@ -480,9 +500,13 @@ export default function App() {
               </button>
             </div>
             
-            <div className="flex items-center justify-center gap-1.5 mt-4 text-[10px] text-zinc-600 font-medium uppercase tracking-tighter">
+            <div className={`flex items-center justify-center gap-1.5 mt-4 text-[10px] font-medium uppercase tracking-tighter transition-colors duration-500 ${isDeepMode ? "text-purple-400" : "text-zinc-600"}`}>
               <AlertCircle size={10} />
-              <span>Contextual results from Llama-3-8B & Pinecone Serverless</span>
+              <span>
+                {isDeepMode
+                  ? "Deep Document Analysis via Google Gemini 2.5 Flash"
+                  : "Contextual results from Llama-3-8B & Pinecone Serverless"}
+              </span>
             </div>
           </div>
         </div>
