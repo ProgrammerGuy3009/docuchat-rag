@@ -30,3 +30,6 @@ google-genai
 
 # --- Async HTTP ---
 httpx
+
+# --- Retries ---
+tenacity

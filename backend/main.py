@@ -29,6 +29,7 @@ import fitz  # PyMuPDF
 import voyageai
 import base64
 from google import genai
+from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type
 
 # ---------------------------------------------------------------------------
 # LangSmith Tracing — automatically enabled when env vars are set
@@ -88,8 +89,7 @@ gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 ingestion_jobs: dict = {}    # job_id → {status, progress messages, etc.}
 document_cache: dict = {}    # session_id → full extracted text (for Gemini Deep Path)
 
-# Backpressure: limit concurrent VoyageAI calls
-VOYAGE_SEMAPHORE = asyncio.Semaphore(3)
+# Backpressure: handled via tenacity and mandatory pacing delays
 
 
 # ---------------------------------------------------------------------------
@@ -289,39 +289,22 @@ async def generate_embeddings(texts: list[str], input_type: str = "document") ->
     return result.embeddings
 
 
-async def embed_with_backpressure(chunks: list[str], input_type: str = "document", batch_size: int = 8) -> list[list[float]]:
+@retry(
+    wait=wait_exponential(multiplier=2, min=4, max=60), 
+    stop=stop_after_attempt(5),
+    retry=retry_if_exception_type(Exception)
+)
+async def embed_with_tenacity(batch: list[str], input_type: str = "document") -> list[list[float]]:
     """
-    Rate-limited embedding with Semaphore + exponential backoff.
-    Processes chunks in micro-batches to avoid 429 errors.
+    Rate-limited embedding with Tenacity exponential backoff.
+    Processes the entire wave's chunks in one API call.
     """
-    all_embeddings = []
-
-    async def _embed_batch(batch: list[str]) -> list[list[float]]:
-        async with VOYAGE_SEMAPHORE:
-            for attempt in range(4):  # max 3 retries
-                try:
-                    result = await voyage_client.embed(batch, model="voyage-3", input_type=input_type)
-                    return result.embeddings
-                except Exception as e:
-                    if "429" in str(e) or "rate" in str(e).lower():
-                        wait = 2 ** attempt  # 1s, 2s, 4s, 8s
-                        logger.warning(f"⏳ VoyageAI rate-limited, backing off {wait}s...")
-                        await asyncio.sleep(wait)
-                    else:
-                        raise
-            raise Exception("VoyageAI rate limit exceeded after 4 retries")
-
-    # Fire micro-batches concurrently (limited by semaphore)
-    tasks = []
-    for i in range(0, len(chunks), batch_size):
-        batch = chunks[i:i + batch_size]
-        tasks.append(_embed_batch(batch))
-
-    results = await asyncio.gather(*tasks)
-    for batch_result in results:
-        all_embeddings.extend(batch_result)
-
-    return all_embeddings
+    try:
+        result = await voyage_client.embed(batch, model="voyage-3", input_type=input_type)
+        return result.embeddings
+    except Exception as e:
+        logger.warning(f"⏳ VoyageAI rate-limited or error, backoff triggered: {e}")
+        raise
 
 
 @traceable(name="search_pinecone")
@@ -441,8 +424,8 @@ async def upload_pdf(
 
 
 async def _run_ingestion(job_id: str, contents: bytes, filename: str, session_id: str):
-    """Wave-based background ingestion — processes 25 pages at a time to stay under 512MB RAM."""
-    WAVE_SIZE = 25
+    """Wave-based background ingestion — processes 5 pages at a time to stay under API limits."""
+    WAVE_SIZE = 5
     start_time = time.time()
     job = ingestion_jobs[job_id]
 
@@ -520,9 +503,9 @@ async def _run_ingestion(job_id: str, contents: bytes, filename: str, session_id
             # Prepend DNA to every chunk
             chunks = [f"[DOCUMENT CONTEXT]: {doc_summary}\n\n{chunk}" for chunk in raw_chunks]
 
-            # Embed with backpressure
+            # Embed via single batch with tenacity
             _progress("embedding", f"Embedding {len(chunks)} chunks (wave {wave_num + 1})...")
-            embeddings = await embed_with_backpressure(chunks, input_type="document")
+            embeddings = await embed_with_tenacity(chunks, input_type="document")
 
             # Upsert to Pinecone
             _progress("uploading", f"Syncing wave {wave_num + 1} to Pinecone...")
@@ -543,6 +526,11 @@ async def _run_ingestion(job_id: str, contents: bytes, filename: str, session_id
                 pinecone_index.upsert(vectors=batch_vectors, namespace=session_id)
 
             total_chunks_stored += len(chunks)
+
+            # Mandatory pacing delay (to never exceed 3 RPM limit)
+            if wave_num < total_waves - 1:
+                _progress("pacing", "Cooling down for 22s to respect VoyageAI free tier limits...")
+                await asyncio.sleep(22)
 
             # Free memory from this wave
             del wave_text_parts, wave_text, raw_chunks, chunks, embeddings
