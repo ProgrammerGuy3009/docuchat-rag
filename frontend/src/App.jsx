@@ -45,6 +45,9 @@ export default function App() {
   const [uploadStep, setUploadStep] = useState("");
   const [uploadDetail, setUploadDetail] = useState("");
 
+  const [showLanding, setShowLanding] = useState(true);
+  const fileInputRef = useRef(null);
+
   const [sessionId, setSessionId] = useState(() => Math.random().toString(36).substring(2, 10));
 
   const handleNewChat = () => {
@@ -52,6 +55,15 @@ export default function App() {
     setFile(null);
     setMessages([
       { role: "bot", text: "Session cleared. Ready for a new document." }
+    ]);
+  };
+
+  const handleHomeReset = () => {
+    setSessionId(Math.random().toString(36).substring(2, 10));
+    setFile(null);
+    setShowLanding(true);
+    setMessages([
+      { role: "bot", text: "Hello. I am connected to your knowledge base. Upload a document to begin analysis." }
     ]);
   };
   
@@ -64,6 +76,7 @@ export default function App() {
   const handleUpload = async (selectedFile) => {
     if (!selectedFile) return;
     setFile(selectedFile);
+    setShowLanding(false);
     setUploading(true);
     setUploadStep("Uploading...");
     setUploadDetail("Transferring file securely");
@@ -200,12 +213,15 @@ export default function App() {
           >
             {/* Logo Area */}
             <div className="h-16 flex items-center px-6 border-b border-zinc-800/50 justify-between">
-              <div className="flex items-center gap-3 text-zinc-100">
+              <button 
+                onClick={handleHomeReset} 
+                className="flex items-center gap-3 text-zinc-100 hover:text-white transition-colors cursor-pointer text-left"
+              >
                 <div className="w-7 h-7 bg-white text-black rounded-md flex items-center justify-center">
                   <Command size={16} strokeWidth={2.5} />
                 </div>
                 <span className="font-semibold tracking-tight text-sm uppercase">DocuChat</span>
-              </div>
+              </button>
               <button 
                 onClick={() => setSidebarOpen(false)} 
                 className="md:hidden text-zinc-500 hover:text-zinc-300 transition-colors"
@@ -308,6 +324,47 @@ export default function App() {
           </div>
         </header>
 
+        {/* Hidden Global File Input */}
+        <input 
+          type="file" 
+          accept=".pdf"
+          ref={fileInputRef}
+          onChange={(e) => handleUpload(e.target.files[0])}
+          className="hidden"
+          disabled={uploading}
+        />
+
+        {showLanding ? (
+          <div className="flex-1 flex flex-col items-center justify-center p-8 bg-[#09090b] text-center relative overflow-hidden">
+            <div className="absolute inset-0 bg-gradient-to-b from-transparent to-zinc-900/10 pointer-events-none" />
+            
+            <div className="relative z-10 max-w-2xl mx-auto flex flex-col items-center">
+              <div className="w-16 h-16 bg-white text-black rounded-2xl flex items-center justify-center mb-8 shadow-2xl">
+                <Command size={32} strokeWidth={2} />
+              </div>
+              <h1 className="text-4xl md:text-5xl font-bold tracking-tight text-white mb-6">
+                Understand your documents.
+              </h1>
+              <p className="text-lg text-zinc-400 mb-10 max-w-xl leading-relaxed">
+                DocuChat uses Pinecone vector search and Llama-3 to instantly ground your queries in your own data, right down to the page.
+              </p>
+              
+              <button 
+                onClick={() => fileInputRef.current?.click()}
+                className="group relative inline-flex h-12 items-center justify-center overflow-hidden rounded-xl bg-zinc-100 px-8 font-medium text-zinc-900 hover:bg-white transition-all shadow-[0_0_40px_-10px_rgba(255,255,255,0.2)]"
+              >
+                <Plus size={18} className="mr-2 group-hover:rotate-90 transition-transform duration-300" />
+                Upload a PDF
+              </button>
+              
+              <div className="mt-12 flex items-center justify-center gap-8 text-sm text-zinc-500 font-medium">
+                <div className="flex items-center gap-2"><CheckCircle2 size={16} className="text-zinc-600" /> Serverless Vector Search</div>
+                <div className="flex items-center gap-2"><CheckCircle2 size={16} className="text-zinc-600" /> Intelligent Highlighting</div>
+              </div>
+            </div>
+          </div>
+        ) : (
+          <>
         {/* Chat Feed */}
         <div className="flex-1 overflow-y-auto p-4 md:p-8 scroll-smooth">
           <div className="max-w-3xl mx-auto space-y-10 pb-32">
@@ -391,7 +448,11 @@ export default function App() {
           <div className="max-w-3xl mx-auto pointer-events-auto">
             <div className="relative flex items-end gap-2 bg-[#121214] border border-zinc-800 focus-within:border-zinc-600 rounded-2xl p-2 transition-all shadow-2xl shadow-black/40">
               
-              <button className="p-3 text-zinc-500 hover:text-zinc-300 transition-colors shrink-0">
+              <button 
+                onClick={() => fileInputRef.current?.click()}
+                disabled={uploading}
+                className="p-3 text-zinc-500 hover:text-zinc-300 transition-colors shrink-0 disabled:opacity-50"
+              >
                 <Paperclip size={18} />
               </button>
 
@@ -425,6 +486,8 @@ export default function App() {
             </div>
           </div>
         </div>
+          </>
+        )}
 
       </div>
     </div>

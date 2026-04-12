@@ -290,8 +290,8 @@ async def generate_embeddings(texts: list[str], input_type: str = "document") ->
 
 
 @retry(
-    wait=wait_exponential(multiplier=2, min=4, max=60), 
-    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=2, min=5, max=120), 
+    stop=stop_after_attempt(12),
     retry=retry_if_exception_type(Exception)
 )
 async def embed_with_tenacity(batch: list[str], input_type: str = "document") -> list[list[float]]:
