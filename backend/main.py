@@ -424,8 +424,8 @@ async def upload_pdf(
 
 
 async def _run_ingestion(job_id: str, contents: bytes, filename: str, session_id: str):
-    """Wave-based background ingestion — processes 5 pages at a time to stay under API limits."""
-    WAVE_SIZE = 5
+    """Wave-based background ingestion — processes 2 pages at a time to stay under API limits."""
+    WAVE_SIZE = 2
     start_time = time.time()
     job = ingestion_jobs[job_id]
 
