@@ -13,3 +13,9 @@ backend/fastembed_cache/
 frontend/node_modules/
 frontend/dist/
 frontend/.env
+
+# --- AGENT ARTIFACTS ---
+videoscript.md
+video_script.md
+resume_bullets.md
+claim_audit.md

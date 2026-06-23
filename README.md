@@ -33,7 +33,7 @@
 ## 🧠 The 14 Advanced Techniques
 
 ### Ingestion Pipeline
-1. **Wave-Based Streaming Ingestion** — Processes 2 pages at a time, freeing memory after each wave. Architecturally designed to handle 1000+ page documents on a 512MB RAM server via memory-mapped I/O and wave-based memory release.
+1. **Wave-Based Streaming Ingestion** — Processes 15 pages at a time, freeing memory after each wave. Architecturally designed to handle 1000+ page documents on a 512MB RAM server via memory-mapped I/O and wave-based memory release.
 2. **Contextual Chunking (Anthropic's Method)** — Before chunking, a 1-sentence "DNA Summary" of the entire document is generated and prepended to every chunk, ensuring isolated paragraphs never lose their global context.
 3. **Payload-Aware Routing** — Small documents (≤5 pages) use Groq 8B for the summary. Large documents (>5 pages) route to Gemini's 1M-token context window.
 4. **Multimodal Vision Extraction** — PyMuPDF extracts embedded images/charts, sends them to Groq's Vision LLM (`llama-3.2-11b-vision-preview`), and injects the text descriptions into the vector database.
@@ -62,7 +62,7 @@
 │  PDF Upload → 202 Accepted (instant)               │
 │       │                                            │
 │       ▼                                            │
-│  Background Task: Wave Processing (2 pages/wave)   │
+│  Background Task: Wave Processing (15 pages/wave)  │
 │       │                                            │
 │  For each wave:                                    │
 │    ├── Extract text (PyMuPDF)                      │
