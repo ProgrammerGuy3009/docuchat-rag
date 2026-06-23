@@ -10,8 +10,10 @@ import asyncio
 import io
 import logging
 import os
+import tempfile
 import time
 import uuid
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -85,9 +87,55 @@ groq_client = AsyncGroq(api_key=GROQ_API_KEY)
 voyage_client = voyageai.AsyncClient(api_key=VOYAGE_API_KEY)
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
+# ---------------------------------------------------------------------------
+# Bounded TTL Cache (prevents unbounded memory growth on free-tier)
+# ---------------------------------------------------------------------------
+class BoundedTTLCache:
+    """
+    LRU cache with max entries and TTL eviction.
+    Prevents document_cache from consuming all available memory
+    on Render's 512MB free-tier instances.
+    """
+    def __init__(self, max_entries: int = 5, ttl_seconds: int = 3600):
+        self._store: OrderedDict = OrderedDict()
+        self._timestamps: dict = {}
+        self.max_entries = max_entries
+        self.ttl_seconds = ttl_seconds
+
+    def __setitem__(self, key, value):
+        self._evict_expired()
+        if key in self._store:
+            self._store.move_to_end(key)
+        elif len(self._store) >= self.max_entries:
+            oldest_key, _ = self._store.popitem(last=False)
+            self._timestamps.pop(oldest_key, None)
+            logger.info(f"🗑️ Cache evicted oldest session: {oldest_key}")
+        self._store[key] = value
+        self._timestamps[key] = time.time()
+
+    def __getitem__(self, key):
+        self._evict_expired()
+        if key in self._store:
+            self._store.move_to_end(key)
+            return self._store[key]
+        raise KeyError(key)
+
+    def __contains__(self, key):
+        self._evict_expired()
+        return key in self._store
+
+    def _evict_expired(self):
+        now = time.time()
+        expired = [k for k, ts in self._timestamps.items() if now - ts > self.ttl_seconds]
+        for k in expired:
+            self._store.pop(k, None)
+            self._timestamps.pop(k, None)
+            logger.info(f"🗑️ Cache TTL expired for session: {k}")
+
+
 # Server-side state for background ingestion and Gemini Deep Path
 ingestion_jobs: dict = {}    # job_id → {status, progress messages, etc.}
-document_cache: dict = {}    # session_id → full extracted text (for Gemini Deep Path)
+document_cache = BoundedTTLCache(max_entries=5, ttl_seconds=3600)  # LRU + 1hr TTL
 
 # Backpressure: handled via tenacity and mandatory pacing delays
 
@@ -397,7 +445,15 @@ async def upload_pdf(
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are accepted.")
 
+    # Write upload to temp file to reduce peak memory
+    # (fitz.open on a file path uses memory-mapped I/O vs loading full bytes into Python heap)
     contents = await file.read()
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+    tmp.write(contents)
+    tmp.close()
+    pdf_path = tmp.name
+    del contents  # Free upload bytes from Python heap immediately
+
     job_id = str(uuid.uuid4())[:8]
 
     # Initialize job tracking
@@ -410,7 +466,7 @@ async def upload_pdf(
 
     # Spawn background task
     background_tasks.add_task(
-        _run_ingestion, job_id, contents, file.filename, session_id
+        _run_ingestion, job_id, pdf_path, file.filename, session_id
     )
 
     return JSONResponse(
@@ -423,7 +479,7 @@ async def upload_pdf(
     )
 
 
-async def _run_ingestion(job_id: str, contents: bytes, filename: str, session_id: str):
+async def _run_ingestion(job_id: str, pdf_path: str, filename: str, session_id: str):
     """Wave-based background ingestion — processes 2 pages at a time to stay under API limits."""
     WAVE_SIZE = 2
     start_time = time.time()
@@ -434,7 +490,7 @@ async def _run_ingestion(job_id: str, contents: bytes, filename: str, session_id
         logger.info(f"📄 [{job_id}] {step}: {detail}")
 
     try:
-        doc = fitz.open(stream=contents, filetype="pdf")
+        doc = fitz.open(pdf_path)  # memory-mapped I/O, much lighter than stream=bytes
         total_pages = len(doc)
         _progress("started", f"Processing {filename} ({total_pages} pages)")
 
@@ -556,6 +612,13 @@ async def _run_ingestion(job_id: str, contents: bytes, filename: str, session_id
         logger.error(f"❌ [{job_id}] Ingestion failed: {e}", exc_info=True)
         job["status"] = "failed"
         job["progress"].append({"step": "error", "detail": str(e), "ts": time.time()})
+    finally:
+        # Always clean up the temporary PDF file
+        try:
+            os.unlink(pdf_path)
+            logger.info(f"🗑️ [{job_id}] Temp file cleaned up")
+        except OSError:
+            pass
 
 
 @app.get("/ingestion-progress/{job_id}", tags=["Documents"])
