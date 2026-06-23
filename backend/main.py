@@ -204,8 +204,13 @@ async def global_exception_handler(request: Request, exc: Exception):
     if request.url.path.endswith("/chat/"):
         async def error_stream():
             yield f"[MODE:FAST]Error: Backend API failure (likely rate limits) - {str(exc)}"
-        return StreamingResponse(error_stream(), media_type="text/event-stream")
-    return JSONResponse(status_code=500, content={"detail": f"Internal Server Error: {str(exc)}"})
+        response = StreamingResponse(error_stream(), media_type="text/event-stream")
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        return response
+        
+    response = JSONResponse(status_code=500, content={"detail": f"Internal Server Error: {str(exc)}"})
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    return response
 
 
 
