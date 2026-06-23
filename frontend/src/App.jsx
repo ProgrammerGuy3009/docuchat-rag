@@ -95,10 +95,10 @@ export default function App() {
       evtSource.onmessage = (event) => {
         const data = JSON.parse(event.data);
         
-        if (data.step === "complete" || data.step === "result") {
+        if (data.step === "result") {
           evtSource.close();
           setUploading(false);
-          const detail = data.step === "result" ? data.detail : {};
+          const detail = data.detail || {};
           setMessages(prev => [...prev, { 
             role: "bot", 
             text: `✅ Document "${selectedFile.name}" indexed successfully!\n\n📊 **${detail.pages || '?'} pages** processed into **${detail.chunks_stored || '?'} chunks** in **${detail.processing_time_seconds || '?'}s**. How can I help you analyze it?` 
@@ -120,7 +120,9 @@ export default function App() {
           summarizing: "🧬 Generating DNA Summary...",
           extracting: "📄 Extracting Text...",
           embedding: "🧮 Generating Vectors...",
-          uploading: "☁️ Syncing to Database..."
+          uploading: "☁️ Syncing to Database...",
+          pacing: "⏳ Rate limit cooldown...",
+          complete: "✅ Finalizing..."
         };
         setUploadStep(stepNames[data.step] || data.step);
         setUploadDetail(data.detail);

@@ -667,9 +667,9 @@ async def chat(request: ChatRequest):
     router_prompt = (
         "You are a routing logic system and compliance filter. The user has asked the following message: "
         f"'{user_query}'\n"
-        "If this is a simple greeting, a thank you, or a basic conversational statement that DOES NOT require scanning an uploaded document, output EXACTLY the word SIMPLE. "
+        "If this is ONLY a casual greeting (like 'hi', 'hello', 'thanks', 'goodbye') with absolutely NO reference to any document, file, content, or information request, output EXACTLY the word SIMPLE. "
         "If the user is submitting or asking about a password, credit card, social security number, or explicit personal secret to you, output EXACTLY the word REDACTED. "
-        "If this is asking for knowledge, facts, numbers, or requires document analysis, output EXACTLY the word COMPLEX."
+        "For ANYTHING else — including any question about a document, file, page, content, summary, or any request for information, facts, or analysis — output EXACTLY the word COMPLEX."
     )
     router_resp = await groq_client.chat.completions.create(
         model="llama-3.1-8b-instant",
