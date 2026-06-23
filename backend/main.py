@@ -21,7 +21,7 @@ import httpx
 import re
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, UploadFile, Form, BackgroundTasks
+from fastapi import FastAPI, File, HTTPException, UploadFile, Form, BackgroundTasks, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from groq import AsyncGroq
@@ -197,6 +197,16 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    logger.error(f"❌ Unhandled exception on {request.url.path}: {exc}", exc_info=True)
+    if request.url.path.endswith("/chat/"):
+        async def error_stream():
+            yield f"[MODE:FAST]Error: Backend API failure (likely rate limits) - {str(exc)}"
+        return StreamingResponse(error_stream(), media_type="text/event-stream")
+    return JSONResponse(status_code=500, content={"detail": f"Internal Server Error: {str(exc)}"})
+
 
 
 # ---------------------------------------------------------------------------

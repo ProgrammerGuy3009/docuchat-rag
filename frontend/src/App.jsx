@@ -419,6 +419,12 @@ export default function App() {
                   }`}>
                     {msg.role === "user" ? (
                       msg.text
+                    ) : msg.text === "" && index === messages.length - 1 ? (
+                      <div className="flex gap-1.5 py-2 h-[27px] items-center">
+                        <span className="w-1 h-1 bg-zinc-600 rounded-full animate-bounce"></span>
+                        <span className="w-1 h-1 bg-zinc-600 rounded-full animate-bounce delay-75"></span>
+                        <span className="w-1 h-1 bg-zinc-600 rounded-full animate-bounce delay-150"></span>
+                      </div>
                     ) : (
                       <ReactMarkdown 
                         className="prose prose-invert max-w-none text-[15px] leading-relaxed"
@@ -441,26 +447,6 @@ export default function App() {
                 </div>
               </motion.div>
             ))}
-            
-            {loading && (
-              <motion.div 
-                initial={{ opacity: 0 }} 
-                animate={{ opacity: 1 }} 
-                className="flex gap-5 flex-row max-w-3xl mx-auto"
-              >
-                <div className="w-8 h-8 rounded-lg flex items-center justify-center shrink-0 border bg-white text-black border-zinc-200">
-                  <Command size={14} strokeWidth={2.5} />
-                </div>
-                <div className="flex flex-col items-start">
-                  <span className="text-[10px] font-bold text-zinc-600 mb-1.5 uppercase tracking-widest">Assistant</span>
-                  <div className="flex gap-1.5 py-2">
-                    <span className="w-1 h-1 bg-zinc-600 rounded-full animate-bounce"></span>
-                    <span className="w-1 h-1 bg-zinc-600 rounded-full animate-bounce delay-75"></span>
-                    <span className="w-1 h-1 bg-zinc-600 rounded-full animate-bounce delay-150"></span>
-                  </div>
-                </div>
-              </motion.div>
-            )}
             <div ref={messagesEndRef} className="h-2" />
           </div>
         </div>
