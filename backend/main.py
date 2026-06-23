@@ -676,9 +676,10 @@ async def chat(request: ChatRequest):
     try:
         return await _chat_impl(request)
     except Exception as e:
-        logger.error(f"Chat error: {e}", exc_info=True)
+        error_msg = str(e)
+        logger.error(f"Chat error: {error_msg}", exc_info=True)
         async def error_stream():
-            yield f"[MODE:FAST]Error: Backend API failure (likely rate limits) - {str(e)}"
+            yield f"[MODE:FAST]Error: Backend API failure (likely rate limits) - {error_msg}"
         response = StreamingResponse(error_stream(), media_type="text/event-stream")
         response.headers["Access-Control-Allow-Origin"] = "*"
         return response
