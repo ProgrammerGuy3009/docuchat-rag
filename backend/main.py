@@ -673,6 +673,17 @@ async def ingestion_progress(job_id: str):
 @app.post("/chat/", tags=["Chat"])
 @traceable(name="chat")
 async def chat(request: ChatRequest):
+    try:
+        return await _chat_impl(request)
+    except Exception as e:
+        logger.error(f"Chat error: {e}", exc_info=True)
+        async def error_stream():
+            yield f"[MODE:FAST]Error: Backend API failure (likely rate limits) - {str(e)}"
+        response = StreamingResponse(error_stream(), media_type="text/event-stream")
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        return response
+
+async def _chat_impl(request: ChatRequest):
     """V5 Infinite: Router → HyDE + Embed → Cache → Search → Rerank → Adaptive RAG (Fast or Deep Path)"""
     start_time = time.time()
 
